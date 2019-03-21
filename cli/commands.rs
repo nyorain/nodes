@@ -1,19 +1,36 @@
-use rusqlite::{Connection, ToSql};
 use super::util;
-use std::process;
-use clap::value_t;
-use tempfile::NamedTempFile;
+
 use std::io::prelude::*;
 use std::io;
+use std::process;
+
+use rusqlite::{Connection, ToSql};
+use clap::value_t;
+use tempfile::NamedTempFile;
 
 pub fn rm(conn: &Connection, args: &clap::ArgMatches) -> i32 {
-    0
-}
+    let mut query: String = "
+        DELETE FROM nodes
+        WHERE id IN (".to_string();
+    let mut count = 0;
+    let errors = util::operate_ids_stdin(args, "id", |id| {
+        if count != 0 {
+            query += ",";
+        }
 
-pub fn select(conn: &Connection, args: &clap::ArgMatches) -> i32 {
-    0
-}
+        query += &id.to_string();
+        count += 1;
+    });
 
+    if count == 0 {
+        println!("No valid ids given");
+        return -1;
+    }
+
+    query += ")";
+    let res = conn.execute(&query, rusqlite::NO_PARAMS).unwrap();
+    (count - res) as i32 + errors
+}
 
 pub fn ls(conn: &Connection, args: &clap::ArgMatches) -> i32 {
     // number of lines to output as node preview
@@ -102,18 +119,38 @@ pub fn create(conn: &Connection, args: &clap::ArgMatches) -> i32 {
     0
 }
 
-pub fn show(conn: &Connection, args: &clap::ArgMatches) -> i32 {
+pub fn output(conn: &Connection, args: &clap::ArgMatches) -> i32 {
+    let id = value_t!(args, "id", u32).unwrap_or_else(|e| e.exit());
+    let r = conn.query_row(
+        "SELECT content FROM nodes WHERE id = ?1", &[id],
+        |row| {
+            println!("{}", &row.get_raw(0).as_str().unwrap());
+            Ok(())
+        }
+    );
+
+    if let Err(e) = r {
+        if e == rusqlite::Error::QueryReturnedNoRows {
+            println!("No such node: {}", id);
+            return -1;
+        }
+
+        println!("{}", e);
+        return -2;
+    }
+
     0
 }
 
 pub fn edit(conn: &Connection, args: &clap::ArgMatches) -> i32 {
     let id = value_t!(args, "id", u32).unwrap_or_else(|e| e.exit());
 
+    // NOTE: maybe this all can be done more efficiently with a memory map?
     // copy node content into file
     let mut file = NamedTempFile::new().unwrap();
-    let r = conn.query_row_and_then(
+    let r = conn.query_row(
         "SELECT content FROM nodes WHERE id = ?1", &[id],
-        |row| -> rusqlite::Result<()> {
+        |row| {
             file.write(&row.get_raw(0).as_str().unwrap().as_bytes()).unwrap();
             file.seek(io::SeekFrom::Start(0)).unwrap();
             Ok(())
@@ -142,13 +179,12 @@ pub fn edit(conn: &Connection, args: &clap::ArgMatches) -> i32 {
     let mut content = String::new();
     file.into_file().read_to_string(&mut content).unwrap();
 
-    println!("begin");
-    println!("{}", content);
-    println!("end");
-
+    // update content, set last seen and edited
     let query = "
         UPDATE nodes
-        SET content = ?1
+        SET content = ?1,
+            edited = CURRENT_TIMESTAMP,
+            viewed = CURRENT_TIMESTAMP
         WHERE id = ?2";
     conn.execute(query, &[&content, &id as &ToSql]).unwrap();
 

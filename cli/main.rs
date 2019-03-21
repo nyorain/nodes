@@ -1,8 +1,10 @@
 use rusqlite::Connection;
 use clap::clap_app;
+use sqlnodes::Config;
 
 mod commands;
 mod util;
+mod select;
 
 fn is_uint(v: String) -> Result<(), String> {
     if let Err(_) = v.parse::<u64>() {
@@ -31,9 +33,6 @@ fn main() -> rusqlite::Result<()> {
         (author: "nyorain [at gmail dot com]")
         (about: "Manages your node system from the command line")
         (@arg storage: -s --storage +takes_value "The storage to use")
-        (@arg local: -l --local
-            conflicts_with("storage")
-            "Search for a local node storage in current directory")
         (@subcommand create =>
             (about: "Creates a new node")
             (alias: "c")
@@ -66,9 +65,9 @@ fn main() -> rusqlite::Result<()> {
                 "Show only archived nodes")
             (@arg debug_condition: -d !takes_value !required +hidden
                 "Debug the condition tree")
-        ) (@subcommand show =>
-            (about: "Shows a node")
-            (alias: "s")
+        ) (@subcommand output =>
+            (about: "Output the content of a node")
+            (alias: "o")
             (@arg id: +required index(1) {is_node} "Id of node to show")
         ) (@subcommand edit =>
             (about: "Edits a node")
@@ -81,6 +80,7 @@ fn main() -> rusqlite::Result<()> {
            (about: "Resolves a node reference to a path")
         ) (@subcommand select =>
             (about: "Select a list of nodes, ids will be printed to stdout")
+            (alias: "s")
             (@arg pattern: index(1)
                 "Only list nodes matching this pattern")
             (@arg num: -n --num +takes_value
@@ -94,7 +94,20 @@ fn main() -> rusqlite::Result<()> {
         )
     ).get_matches();
 
-    let conn: rusqlite::Connection = Connection::open("nodes.db")?;
+    let config = Config::load_default().expect("Error loading config");
+    let mut storage_path = match matches.value_of("storage") {
+        Some(name) => match config.storage_folder(name) {
+            Some(path) => path.clone(),
+            None => {
+                println!("Storage '{}' unknown", name);
+                std::process::exit(1);
+            }
+        }, None => config.default_storage_folder().clone(),
+    };
+    storage_path.push("nodes.db");
+    println!("{}", storage_path.to_str().unwrap());
+
+    let conn: rusqlite::Connection = Connection::open(storage_path)?;
     // XXX: this may not be desired by all users, make it configurable
     // drastically improves performance, especially on hdds
     // e.g. creation time goes down from "about a seond" to
@@ -103,17 +116,21 @@ fn main() -> rusqlite::Result<()> {
     // on an ssd or ramdisk
     conn.pragma_update(None, "SYNCHRONOUS", &0).unwrap();
 
-    match matches.subcommand() {
+    // TODO: if database is empty, create tables
+    // maybe only check whether or not file already exists?
+    // and how to upgrade to a new schema? store version?
+
+    let r = match matches.subcommand() {
         ("rm", Some(s)) => commands::rm(&conn, s),
         ("edit", Some(s)) => commands::edit(&conn, s),
         ("create", Some(s)) => commands::create(&conn, s),
         ("ls", Some(s)) => commands::ls(&conn, s),
-        ("select", Some(s)) => commands::select(&conn, s),
-        ("show", Some(s)) => commands::show(&conn, s),
+        ("select", Some(s)) => select::select(&conn, s),
+        ("output", Some(s)) => commands::output(&conn, s),
         // TODO: default action when just a node id is given
         // e.g. should `nodes 234` should show/edit that node?
-        _ => commands::select(&conn, &clap::ArgMatches::default())
+        _ => select::select(&conn, &clap::ArgMatches::default())
     };
 
-    Ok(())
+    std::process::exit(r);
 }
