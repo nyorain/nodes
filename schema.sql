@@ -1,13 +1,16 @@
 PRAGMA encoding = "UTF-8";
 
+DROP TABLE IF EXISTS nodes;
+DROP TABLE IF EXISTS tags;
+
 CREATE TABLE nodes (
 	id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
 	content TEXT NOT NULL,
 	-- mimetype TEXT NOT NULL, -- strictly follow mime standard
 	created DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, -- creation date
 	edited DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, -- last edit date (edit command invoked)
-	viewed DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP -- last date viewed (edit/show command invoked)
-	-- archieved BOOLEAN NOT NULL DEFAULT false
+	viewed DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, -- last date viewed (edit/show command invoked)
+	archived BOOLEAN NOT NULL DEFAULT false
 );
 
 CREATE TABLE tags (

@@ -1,15 +1,15 @@
 [package]
-name = "sqlnodes"
+name = "nodes"
 version = "0.1.0"
 authors = ["nyorain <nyorain@gmail.com>"]
 edition = "2018"
 
 [lib]
-name = "sqlnodes"
+name = "nodes"
 path = "src/lib.rs"
 
 [[bin]]
-name = "sqlnodes"
+name = "nodes"
 path = "cli/main.rs"
 
 [dependencies]

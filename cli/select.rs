@@ -109,12 +109,12 @@ pub fn select(conn: &Connection, args: &clap::ArgMatches) -> i32 {
                     acount = cmp::max(acount, 1);
                     current = cmp::min(nodes.len() - 1, current + acount);
                     if current - start >= (maxy as usize) {
-                        start += current - start - (maxy as usize);
+                        start = current - ((maxy - 1) as usize);
                     }
                 },
                 Key::Char('G') => {
                     current = nodes.len() - 1;
-                    start = cmp::max((current as i32) - (maxy as i32), 0) as usize;
+                    start = current.saturating_sub((maxy - 1) as usize);
                 },
                 Key::Char('g') => {
                     if gpending {

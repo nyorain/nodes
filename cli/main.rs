@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 use clap::clap_app;
-use sqlnodes::Config;
+use nodes::Config;
 
 mod commands;
 mod util;
@@ -105,7 +105,6 @@ fn main() -> rusqlite::Result<()> {
         }, None => config.default_storage_folder().clone(),
     };
     storage_path.push("nodes.db");
-    println!("{}", storage_path.to_str().unwrap());
 
     let conn: rusqlite::Connection = Connection::open(storage_path)?;
     // XXX: this may not be desired by all users, make it configurable
