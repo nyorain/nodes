@@ -1,0 +1,20 @@
+[package]
+name = "sqlnodes"
+version = "0.1.0"
+authors = ["nyorain <nyorain@gmail.com>"]
+edition = "2018"
+
+[[bin]]
+name = "sqlnodes"
+path = "cli/main.rs"
+
+[dependencies]
+time = "0.1"
+clap = "2.29"
+termion = "1.5"
+nom = "^4.2"
+tempfile = "3"
+
+[dependencies.rusqlite]
+version = "0.17.0"
+features = ["bundled"]
