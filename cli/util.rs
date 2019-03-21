@@ -1,6 +1,11 @@
 use std::io;
 use std::io::prelude::*;
-use clap::values_t;
+use std::process;
+
+use clap::{values_t, value_t};
+
+use rusqlite::{Connection, ToSql};
+use tempfile::NamedTempFile;
 
 /// Trims the given string to the length max_length.
 /// The last three chars will be "..." if the string was longer
@@ -96,4 +101,101 @@ pub fn operate_ids_stdin<F: FnMut(u32)>(
 
         res
     }
+}
+
+pub struct Node<'a> {
+    pub id: u32,
+    pub content: &'a str,
+}
+
+/// Iterates over all nodes (ordering, limit as specified via args)
+/// and calls `op` with each node.
+pub fn iter_nodes<F: FnMut(&Node)>(conn: &Connection, args: &clap::ArgMatches,
+        mut reverse: bool, mut reverse_display: bool, mut op: F) {
+    let limit = value_t!(args, "num", u32).unwrap_or(0xFFFFFFFFu32);
+
+    // order
+    reverse ^= args.is_present("reverse");
+    let mut preorder = "DESC";
+    if reverse {
+        preorder = "ASC";
+    }
+
+    reverse_display ^= args.is_present("reverse_display");
+    let mut postorder = "DESC";
+    if reverse_display {
+        postorder = "ASC";
+    }
+
+    // query
+    let mut query = format!("
+        SELECT id, content
+        FROM nodes
+        ORDER BY id {order}
+        LIMIT {limit}",
+        order=preorder, limit=limit);
+
+    if preorder != postorder {
+        query = format!("
+            SELECT *
+            FROM ({query})
+            ORDER BY id {order}",
+            query = query, order=postorder);
+    }
+
+    let mut stmt = conn.prepare_cached(&query).unwrap();
+    let mut rows = stmt.query(rusqlite::NO_PARAMS).unwrap();
+    while let Some(row) = rows.next().unwrap() {
+        let n = Node {
+            id: row.get_unwrap(0),
+            content: row.get_raw(1).as_str().unwrap(),
+        };
+        op(&n);
+    }
+}
+
+pub fn edit(conn: &Connection, id: u32) -> bool {
+    // NOTE: maybe this all can be done more efficiently with a memory map?
+    // copy node content into file
+    let mut file = NamedTempFile::new().unwrap();
+    let r = conn.query_row(
+        "SELECT content FROM nodes WHERE id = ?1", &[id],
+        |row| {
+            file.write(&row.get_raw(0).as_str().unwrap().as_bytes()).unwrap();
+            file.seek(io::SeekFrom::Start(0)).unwrap();
+            Ok(())
+        }
+    );
+
+    if let Err(e) = r {
+        if e == rusqlite::Error::QueryReturnedNoRows {
+            println!("No such node: {}", id);
+            return false;
+        }
+
+        println!("{}", e);
+        return false;
+    }
+
+    // run editor on tmp file
+    let prog = vec!("nvim", &file.path().to_str().unwrap());
+    let r = process::Command::new(&prog[0]).args(prog[1..].iter()).status();
+    if let Err(err) = r {
+        println!("Failed to spawn editor: {}", err);
+        return false;
+    }
+
+    // write back
+    let mut content = String::new();
+    file.into_file().read_to_string(&mut content).unwrap();
+
+    // update content, set last seen and edited
+    let query = "
+        UPDATE nodes
+        SET content = ?1,
+            edited = CURRENT_TIMESTAMP,
+            viewed = CURRENT_TIMESTAMP
+        WHERE id = ?2";
+    conn.execute(query, &[&content, &id as &ToSql]).unwrap();
+    true
 }
