@@ -39,8 +39,8 @@ pub fn ls(conn: &Connection, args: &clap::ArgMatches) -> i32 {
     }
 
     // number of nodes to show
-    let width = util::terminal_width() as usize;
-    util::iter_nodes(&conn, &args, false, true, |node| {
+    let width = util::terminal_size().0 as usize;
+    util::iter_nodes_args(&conn, &args, false, true, |node| {
         let summary = util::node_summary(&node.content, lines as usize, width);
         if lines == 1 {
             println!("{}:\t{}", node.id, summary)
@@ -103,6 +103,14 @@ pub fn output(conn: &Connection, args: &clap::ArgMatches) -> i32 {
         println!("{}", e);
         return -2;
     }
+
+    // Strictly speaking we should use a transaction here, but it's
+    // not really a problem in the end
+    let query = "
+        UPDATE nodes
+        SET viewed = CURRENT_TIMESTAMP
+        WHERE id = ?2";
+    conn.execute(query, &[&id]).unwrap();
 
     0
 }

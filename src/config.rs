@@ -87,7 +87,7 @@ impl Config {
 
     pub fn config_path() -> PathBuf {
         let mut p = Config::config_folder();
-        p.push("config2");
+        p.push("config");
         p
     }
 

@@ -7,6 +7,21 @@ use clap::{values_t, value_t};
 use rusqlite::{Connection, ToSql};
 use tempfile::NamedTempFile;
 
+#[derive(PartialEq)]
+pub enum Order {
+    Asc,
+    Desc
+}
+
+impl Order {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Order::Asc => "ASC",
+            Order::Desc => "DESC",
+        }
+    }
+}
+
 /// Trims the given string to the length max_length.
 /// The last three chars will be "..." if the string was longer
 /// than max_length.
@@ -58,10 +73,13 @@ pub fn node_summary(node: &str, mut lines: usize, width: usize) -> String {
 }
 
 /// Returns the current width of the terminal in characters.
-pub fn terminal_width() -> u16 {
+pub fn terminal_size() -> (u16, u16) {
+    // problem: when stdin isn't /dev/tty
+    // let tty = fs::File::open("/dev/tty").unwrap();
+    // TODO: https://github.com/redox-os/termion/blob/master/src/sys/unix/size.rs
     match termion::terminal_size() {
-        Ok((x,_)) => x,
-        _ => 80 // guess
+        Ok((x,y)) => (x,y),
+        _ => (80, 100) // guess
     }
 }
 
@@ -108,39 +126,44 @@ pub struct Node<'a> {
     pub content: &'a str,
 }
 
-/// Iterates over all nodes (ordering, limit as specified via args)
-/// and calls `op` with each node.
-pub fn iter_nodes<F: FnMut(&Node)>(conn: &Connection, args: &clap::ArgMatches,
-        mut reverse: bool, mut reverse_display: bool, mut op: F) {
-    let limit = value_t!(args, "num", u32).unwrap_or(0xFFFFFFFFu32);
+// default order (reverse = false) is ascending for both
+pub fn iter_nodes<F: FnMut(&Node)>(conn: &Connection,
+        preorder: Order,
+        postorder: Order,
+        count: Option<usize>,
+        pattern: Option<&str>,
+        mut op: F) {
 
-    // order
-    reverse ^= args.is_present("reverse");
-    let mut preorder = "DESC";
-    if reverse {
-        preorder = "ASC";
+    let mut qwhere = String::new();
+    let mut qlimit = String::new();
+    if let Some(pattern) = pattern {
+        // escape for sql
+        let pattern = pattern.to_string().replace("'", "''");
+        qwhere = format!("LEFT JOIN tags ON nodes.id = tags.node
+            WHERE content LIKE '%{p}%' OR tag LIKE '%{p}%'",
+            p = pattern);
     }
 
-    reverse_display ^= args.is_present("reverse_display");
-    let mut postorder = "DESC";
-    if reverse_display {
-        postorder = "ASC";
+    if let Some(count) = count {
+        qlimit = format!("LIMIT {}", count);
     }
 
-    // query
     let mut query = format!("
-        SELECT id, content
+        SELECT DISTINCT id, content
         FROM nodes
+        {where}
         ORDER BY id {order}
-        LIMIT {limit}",
-        order=preorder, limit=limit);
+        {limit}",
+        where = qwhere,
+        limit = qlimit,
+        order = preorder.name());
 
     if preorder != postorder {
         query = format!("
             SELECT *
             FROM ({query})
             ORDER BY id {order}",
-            query = query, order=postorder);
+            query = query, order = postorder.name());
     }
 
     let mut stmt = conn.prepare_cached(&query).unwrap();
@@ -152,6 +175,23 @@ pub fn iter_nodes<F: FnMut(&Node)>(conn: &Connection, args: &clap::ArgMatches,
         };
         op(&n);
     }
+}
+
+/// Iterates over all nodes (ordering, limit as specified via args)
+/// and calls `op` with each node.
+pub fn iter_nodes_args<F: FnMut(&Node)>(conn: &Connection, args: &clap::ArgMatches,
+        mut reverse: bool, mut reverse_display: bool, op: F) {
+    reverse ^= args.is_present("reverse");
+    reverse_display ^= args.is_present("reverse_display");
+    let limit = if args.is_present("num") {
+        Some(value_t!(args, "num", usize).unwrap_or_else(|e| e.exit()))
+    } else {
+        None
+    };
+
+    let preorder = if reverse { Order::Desc } else { Order::Asc };
+    let postorder = if reverse_display { Order::Desc } else { Order::Asc };
+    iter_nodes(&conn, preorder, postorder, limit, None, op);
 }
 
 pub fn edit(conn: &Connection, id: u32) -> bool {
