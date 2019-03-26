@@ -29,6 +29,7 @@ pub enum Error {
     SQL(rusqlite::Error), // sql operation failed unexpectedly
     IO(io::Error), // io operation failed unexpectedly
     InvalidNode(u32), // node with id doesn't exist
+    EmptyNode, // create: empty node
 }
 
 impl fmt::Display for Error {
@@ -36,7 +37,8 @@ impl fmt::Display for Error {
         match self {
             Error::SQL(err) => write!(f, "SQL Error: {}", err),
             Error::IO(err) => write!(f, "IO Error: {}", err),
-            Error::InvalidNode(id) => write!(f, "Invalid node id {}", id)
+            Error::InvalidNode(id) => write!(f, "Invalid node id {}", id),
+            Error::EmptyNode => write!(f, "Empty Node not created"),
         }
     }
 }
@@ -46,7 +48,8 @@ impl error::Error for Error {
         match self {
             Error::SQL(err) => err.description(),
             Error::IO(err) => err.description(),
-            Error::InvalidNode(_) => "The given node id was invalid"
+            Error::InvalidNode(_) => "The given node id was invalid",
+            Error::EmptyNode => "Empty Node not created",
         }
     }
 
@@ -54,7 +57,8 @@ impl error::Error for Error {
         match self {
             Error::SQL(err) => Some(err),
             Error::IO(err) => Some(err),
-            Error::InvalidNode(_) => None
+            Error::InvalidNode(_) => None,
+            Error::EmptyNode => None,
         }
     }
 }
@@ -181,6 +185,7 @@ pub fn gather_nodes(args: &clap::ArgMatches, argname: &str) -> Vec<u32> {
 pub struct Node<'a> {
     pub id: u32,
     pub content: &'a str,
+    pub tags: Vec<&'a str>
 }
 
 pub struct ListArgs {
@@ -202,7 +207,6 @@ pub fn iter_nodes<F: FnMut(&Node)>(conn: &Connection,
         args: &ListArgs, mut op: F) {
 
     let mut qwhere = String::new();
-    let mut join = String::new();
     let mut where_add = "WHERE";
 
     if let Some(archived) = args.archived {
@@ -210,29 +214,28 @@ pub fn iter_nodes<F: FnMut(&Node)>(conn: &Connection,
         where_add = "AND";
     }
 
-    let mut qlimit = String::new();
     if !args.pattern.is_empty() {
         // escape for sql
         let pattern = args.pattern.to_string().replace("'", "''");
-        join = "LEFT JOIN tags ON nodes.id = tags.node".to_string();
         qwhere = format!("{} {}
             (content LIKE '%{p}%' OR tag LIKE '%{p}%')",
             qwhere, where_add, p = pattern);
         where_add = "AND";
     }
 
+    let mut qlimit = String::new();
     if let Some(count) = args.count {
         qlimit = format!("LIMIT {}", count);
     }
 
     let mut query = format!("
-        SELECT DISTINCT id, content
+        SELECT DISTINCT id, content, GROUP_CONCAT(tag)
         FROM nodes
-        {join}
+            LEFT JOIN tags ON nodes.id = tags.node
         {where}
+        GROUP BY id
         ORDER BY id {order}
         {limit}",
-        join = join,
         where = qwhere,
         limit = qlimit,
         order = args.preorder.name());
@@ -248,9 +251,11 @@ pub fn iter_nodes<F: FnMut(&Node)>(conn: &Connection,
     let mut stmt = conn.prepare_cached(&query).unwrap();
     let mut rows = stmt.query(rusqlite::NO_PARAMS).unwrap();
     while let Some(row) = rows.next().unwrap() {
+        let tags = row.get_raw(2).as_str().map(|s| s.split(",").collect());
         let n = Node {
             id: row.get_unwrap(0),
             content: row.get_raw(1).as_str().unwrap(),
+            tags: tags.unwrap_or(Vec::new())
         };
         op(&n);
     }
@@ -327,6 +332,29 @@ pub fn edit(conn: &Connection, id: u32) -> Result<(), Error> {
         WHERE id = ?2";
     conn.execute(query, &[&content, &id as &ToSql])?;
     Ok(())
+}
+
+pub fn create(conn: &Connection, gcontent: Option<&str>) -> Result<u32, Error> {
+    let mut content = String::new();
+    if let Some(fcontent) = gcontent {
+        content = fcontent.to_string();
+    } else {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        let prog = vec!("nvim", &path.to_str().unwrap());
+        process::Command::new(&prog[0]).args(prog[1..].iter()).status()?;
+        file.into_file().read_to_string(&mut content).unwrap();
+    }
+
+    if content.is_empty() {
+        return Err(Error::EmptyNode);
+    }
+
+    let query = "
+        INSERT INTO nodes(content)
+        VALUES (?1)";
+    conn.execute(query, &[content])?;
+    Ok(conn.last_insert_rowid() as u32)
 }
 
 pub fn set_archived(conn: &Connection, id: u32, set: bool) -> Result<(), Error> {

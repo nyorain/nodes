@@ -46,35 +46,16 @@ pub fn ls(conn: &Connection, args: &clap::ArgMatches) -> i32 {
 }
 
 pub fn create(conn: &Connection, args: &clap::ArgMatches) -> i32 {
-    let mut content = String::new();
-    if let Some(fcontent) = args.value_of("content") {
-        content = fcontent.to_string();
-    } else {
-        let file = NamedTempFile::new().unwrap();
-        let path = file.path();
-        let prog = vec!("nvim", &path.to_str().unwrap());
-        let r = process::Command::new(&prog[0]).args(prog[1..].iter()).status();
-        if let Err(err) = r {
-            println!("Failed to spawn editor: {}", err);
-            return -2;
+    match util::create(&conn, args.value_of("content")) {
+        Ok(id) => {
+            println!("{}", id);
+            0
         }
-
-        file.into_file().read_to_string(&mut content).unwrap();
+        Err(err) => {
+            eprintln!("{}", err);
+            -2
+        }
     }
-
-    if content.is_empty() {
-        println!("No content given, no node created");
-        return -1;
-    }
-
-    let query = "
-        INSERT INTO nodes(content)
-        VALUES (?1)";
-    conn.execute(query, &[content]).unwrap();
-
-    // output id
-    println!("{}", conn.last_insert_rowid());
-    0
 }
 
 pub fn output(conn: &Connection, args: &clap::ArgMatches) -> i32 {

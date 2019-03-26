@@ -17,6 +17,7 @@ struct SelectNode {
     id: u32,
     summary: String,
     selected: bool,
+    tags: Vec<String>,
 }
 
 struct SelectScreen<'a> {
@@ -55,10 +56,12 @@ impl<'a> SelectScreen<'a> {
         let mut nodes = Vec::new();
         util::iter_nodes(&self.conn, &self.args, |node| {
             let summary = util::node_summary(&node.content, 1, width);
+            let tags = node.tags.iter().map(|s| s.to_string()).collect();
             nodes.push(SelectNode{
                 id: node.id,
                 summary: summary,
-                selected: false
+                selected: false,
+                tags: tags,
             });
         });
         self.nodes = nodes;
@@ -89,12 +92,25 @@ impl<'a> SelectScreen<'a> {
             }
 
             let idstr = node.id.to_string();
-
             let width = (self.termx() as usize) - idstr.len() - 2;
-            write!(screen, "{}{}{}: {:<w$}",
+            let mut sumwidth = width;
+            let mut tagswidth = 0;
+            // TODO: don't hardcode distribution
+            if width > 80 {
+                sumwidth = cmp::max(60, (width as f64 * 0.7) as usize);
+                tagswidth = width - sumwidth;
+            }
+
+            let mut tags = String::new();
+            if !node.tags.is_empty() {
+                tags = "[".to_string() + &node.tags.join("][") + "]";
+            }
+
+            write!(screen, "{}{}{}: {:<sw$}  {:>tw$}",
                 termion::cursor::Goto(x, y),
                 termion::clear::CurrentLine,
-                idstr, node.summary, w = width).unwrap();
+                node.id, node.summary, tags,
+                sw = sumwidth - 2, tw = tagswidth).unwrap();
 
             y += 1;
             i += 1;
@@ -211,20 +227,36 @@ impl<'a> SelectScreen<'a> {
                 Key::Char('a') => { // archive
                     self.archive();
                 },
-                Key::Char('d') | Key::Delete => {
+                Key::Char('d') | Key::Delete => { // delete (with confirmation)
                     self.run_delete(screen, keys);
                 },
-                Key::Char('u') => {
+                Key::Char('r') => { // reload
                     self.termsize = util::terminal_size();
                     self.reload_nodes();
-                }
+                },
+                Key::Char('s') => { // clear selection
+                    for node in &mut self.nodes {
+                        node.selected = false;
+                    }
+                },
+                Key::Char('c') => {
+                    // TODO: display error/id in some kind of status line
+                    // could display it with timeout (like 1 or 2 seconds)
+                    // we wouldn't need an extra thread for that, enough to
+                    // check on user input
+                    match util::create(&self.conn, None) {
+                        Ok(_) => (),
+                        Err(err) => {
+                            eprintln!("{}", err);
+                        }
+                    }
+                    self.reload_nodes();
+                },
                 // TODO:
                 // - page down/up
                 // - somehow show tags/some meta field (already in preview?)
                 //   should be configurable
                 //   additionally? edit/show meta file
-                // - should a/r be applied to all selected? or to the currently
-                //   hovered? maybe like in ncmpcpp? (selected? selected : hovered)
                 // - allow to open/show multiple at once?
                 //   maybe allow to edit/show selected?
                 // - less-like status bar or something?
