@@ -214,6 +214,10 @@ impl<'a> SelectScreen<'a> {
                 Key::Char('d') | Key::Delete => {
                     self.run_delete(screen, keys);
                 },
+                Key::Char('u') => {
+                    self.termsize = util::terminal_size();
+                    self.reload_nodes();
+                }
                 // TODO:
                 // - page down/up
                 // - somehow show tags/some meta field (already in preview?)
