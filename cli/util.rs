@@ -1,6 +1,8 @@
 use std::io;
 use std::io::prelude::*;
 use std::process;
+use std::error;
+use std::fmt;
 
 use clap::{values_t, value_t};
 
@@ -19,6 +21,53 @@ impl Order {
             Order::Asc => "ASC",
             Order::Desc => "DESC",
         }
+    }
+}
+
+#[derive(Debug)]
+pub enum Error {
+    SQL(rusqlite::Error), // sql operation failed unexpectedly
+    IO(io::Error), // io operation failed unexpectedly
+    InvalidNode(u32), // node with id doesn't exist
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Error::SQL(err) => write!(f, "SQL Error: {}", err),
+            Error::IO(err) => write!(f, "IO Error: {}", err),
+            Error::InvalidNode(id) => write!(f, "Invalid node id {}", id)
+        }
+    }
+}
+
+impl error::Error for Error {
+    fn description(&self) -> &str {
+        match self {
+            Error::SQL(err) => err.description(),
+            Error::IO(err) => err.description(),
+            Error::InvalidNode(_) => "The given node id was invalid"
+        }
+    }
+
+    fn cause(&self) -> Option<&error::Error> {
+        match self {
+            Error::SQL(err) => Some(err),
+            Error::IO(err) => Some(err),
+            Error::InvalidNode(_) => None
+        }
+    }
+}
+
+impl From<rusqlite::Error> for Error {
+    fn from(err: rusqlite::Error) -> Self {
+        Error::SQL(err)
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(err: io::Error) -> Self {
+        Error::IO(err)
     }
 }
 
@@ -79,7 +128,7 @@ pub fn terminal_size() -> (u16, u16) {
     // TODO: https://github.com/redox-os/termion/blob/master/src/sys/unix/size.rs
     match termion::terminal_size() {
         Ok((x,y)) => (x,y),
-        _ => (80, 100) // guess
+        _ => (80, 80) // guess
     }
 }
 
@@ -121,49 +170,79 @@ pub fn operate_ids_stdin<F: FnMut(u32)>(
     }
 }
 
+// Gathers the given nodes ids either via the given argument name
+// or via stdin.
+pub fn gather_nodes(args: &clap::ArgMatches, argname: &str) -> Vec<u32> {
+    let mut nodes = Vec::new();
+    operate_ids_stdin(&args, argname, |id| nodes.push(id));
+    nodes
+}
+
 pub struct Node<'a> {
     pub id: u32,
     pub content: &'a str,
 }
 
+pub struct ListArgs {
+    pub preorder: Order,
+    pub postorder: Order,
+    pub count: Option<usize>,
+    pub pattern: String, // empty for no pattern
+    pub archived: Option<bool>,
+}
+
 // default order (reverse = false) is ascending for both
+// preorder: the order of nodes (by id) before limiting/counting
+// postorder: the order of nodes after limiting, i.e. the returned order
+//   different pre-/postorders are only relevent if `count` is given.
+// count: the maximum number of nodes to retrieve. If not given, iterate all
+// pattern: optional pattern; only nodes matching this pattern will be returned
+// archived: if not none, will only retrieve matching nodes
 pub fn iter_nodes<F: FnMut(&Node)>(conn: &Connection,
-        preorder: Order,
-        postorder: Order,
-        count: Option<usize>,
-        pattern: Option<&str>,
-        mut op: F) {
+        args: &ListArgs, mut op: F) {
 
     let mut qwhere = String::new();
-    let mut qlimit = String::new();
-    if let Some(pattern) = pattern {
-        // escape for sql
-        let pattern = pattern.to_string().replace("'", "''");
-        qwhere = format!("LEFT JOIN tags ON nodes.id = tags.node
-            WHERE content LIKE '%{p}%' OR tag LIKE '%{p}%'",
-            p = pattern);
+    let mut join = String::new();
+    let mut where_add = "WHERE";
+
+    if let Some(archived) = args.archived {
+        qwhere = format!("{} {} (archived = {}) ", qwhere, where_add, archived);
+        where_add = "AND";
     }
 
-    if let Some(count) = count {
+    let mut qlimit = String::new();
+    if !args.pattern.is_empty() {
+        // escape for sql
+        let pattern = args.pattern.to_string().replace("'", "''");
+        join = "LEFT JOIN tags ON nodes.id = tags.node".to_string();
+        qwhere = format!("{} {}
+            (content LIKE '%{p}%' OR tag LIKE '%{p}%')",
+            qwhere, where_add, p = pattern);
+        where_add = "AND";
+    }
+
+    if let Some(count) = args.count {
         qlimit = format!("LIMIT {}", count);
     }
 
     let mut query = format!("
         SELECT DISTINCT id, content
         FROM nodes
+        {join}
         {where}
         ORDER BY id {order}
         {limit}",
+        join = join,
         where = qwhere,
         limit = qlimit,
-        order = preorder.name());
+        order = args.preorder.name());
 
-    if preorder != postorder {
+    if args.preorder != args.postorder {
         query = format!("
             SELECT *
             FROM ({query})
             ORDER BY id {order}",
-            query = query, order = postorder.name());
+            query = query, order = args.postorder.name());
     }
 
     let mut stmt = conn.prepare_cached(&query).unwrap();
@@ -177,24 +256,36 @@ pub fn iter_nodes<F: FnMut(&Node)>(conn: &Connection,
     }
 }
 
-/// Iterates over all nodes (ordering, limit as specified via args)
-/// and calls `op` with each node.
-pub fn iter_nodes_args<F: FnMut(&Node)>(conn: &Connection, args: &clap::ArgMatches,
-        mut reverse: bool, mut reverse_display: bool, op: F) {
+pub fn extract_list_args<'a>(args: &'a clap::ArgMatches, mut reverse: bool,
+            mut reverse_display: bool) -> ListArgs {
     reverse ^= args.is_present("reverse");
     reverse_display ^= args.is_present("reverse_display");
+
     let limit = if args.is_present("num") {
         Some(value_t!(args, "num", usize).unwrap_or_else(|e| e.exit()))
     } else {
         None
     };
 
-    let preorder = if reverse { Order::Desc } else { Order::Asc };
-    let postorder = if reverse_display { Order::Desc } else { Order::Asc };
-    iter_nodes(&conn, preorder, postorder, limit, None, op);
+    let archived = if args.is_present("only_archived") {
+        Some(true)
+    } else if args.is_present("archived") {
+        None
+    } else {
+        Some(false)
+    };
+
+    ListArgs {
+        preorder: if reverse { Order::Desc } else { Order::Asc },
+        postorder: if reverse_display { Order::Desc } else { Order::Asc },
+        pattern: args.value_of("pattern").unwrap_or("").to_string(),
+        count: limit,
+        archived: archived,
+    }
 }
 
-pub fn edit(conn: &Connection, id: u32) -> bool {
+/// Edits the node with the given id
+pub fn edit(conn: &Connection, id: u32) -> Result<(), Error> {
     // NOTE: maybe this all can be done more efficiently with a memory map?
     // copy node content into file
     let mut file = NamedTempFile::new().unwrap();
@@ -209,25 +300,23 @@ pub fn edit(conn: &Connection, id: u32) -> bool {
 
     if let Err(e) = r {
         if e == rusqlite::Error::QueryReturnedNoRows {
-            println!("No such node: {}", id);
-            return false;
+            return Err(Error::InvalidNode(id));
         }
 
-        println!("{}", e);
-        return false;
+        return Err(e.into());
     }
 
+    // TODO: use programs from config instead of hardcoding nvim...
     // run editor on tmp file
     let prog = vec!("nvim", &file.path().to_str().unwrap());
-    let r = process::Command::new(&prog[0]).args(prog[1..].iter()).status();
-    if let Err(err) = r {
-        println!("Failed to spawn editor: {}", err);
-        return false;
-    }
+    process::Command::new(&prog[0]).args(prog[1..].iter())
+        .stdout(termion::get_tty().unwrap())
+        .stderr(termion::get_tty().unwrap())
+        .status()?;
 
     // write back
     let mut content = String::new();
-    file.into_file().read_to_string(&mut content).unwrap();
+    file.into_file().read_to_string(&mut content)?;
 
     // update content, set last seen and edited
     let query = "
@@ -236,6 +325,85 @@ pub fn edit(conn: &Connection, id: u32) -> bool {
             edited = CURRENT_TIMESTAMP,
             viewed = CURRENT_TIMESTAMP
         WHERE id = ?2";
-    conn.execute(query, &[&content, &id as &ToSql]).unwrap();
-    true
+    conn.execute(query, &[&content, &id as &ToSql])?;
+    Ok(())
+}
+
+pub fn set_archived(conn: &Connection, id: u32, set: bool) -> Result<(), Error> {
+    let query = "
+        UPDATE nodes
+        SET archived = ?1
+        WHERE id = ?2";
+    conn.execute(query, &[&set, &id as &ToSql])?;
+    Ok(())
+}
+
+// returns sql `in (ids,...)` string for the given ids
+// must be called with at least one value
+pub fn in_string(ids: &[u32]) -> String {
+    let mut qin = "IN (".to_string();
+    let mut first = true;
+    for id in ids {
+        if !first {
+            qin += ",";
+        }
+        qin += &id.to_string();
+        first = false;
+    }
+
+    qin += ")";
+    qin
+}
+
+// TODO: check for invalid ids
+// for all commands below
+pub fn toggle_archived(conn: &Connection, id: u32) -> Result<(), Error> {
+    let query = "
+        UPDATE nodes
+        SET archived = NOT archived
+        WHERE id = ?";
+    conn.execute(query, &[&id])?;
+    Ok(())
+}
+
+pub fn toggle_archived_range(conn: &Connection, ids: &[u32]) -> Result<(), Error> {
+    let query = "
+        UPDATE nodes
+        SET archived = NOT archived
+        WHERE id ".to_string() + &in_string(ids);
+    conn.execute(&query, rusqlite::NO_PARAMS)?;
+    Ok(())
+}
+
+// Returns the number of nodes deleted
+pub fn delete_range(conn: &Connection, ids: &[u32]) -> Result<usize, Error> {
+    if ids.len() == 0 {
+        return Ok(0);
+    }
+
+    let query = "
+        DELETE FROM nodes
+        WHERE id ".to_string() + &in_string(ids);
+    Ok(conn.execute(&query, rusqlite::NO_PARAMS)?)
+}
+
+pub fn delete(conn: &Connection, id: u32) -> Result<(), Error> {
+    let query = "
+        DELETE FROM nodes
+        WHERE id = ?";
+    conn.execute(query, &[&id])?;
+    Ok(())
+}
+
+pub fn add_tag(conn: &Connection, ids: &[u32], tag: &str) -> Result<(), Error> {
+    let mut query = "INSERT INTO tags(node, tag) VALUES ".to_string();
+    let mut comma = "";
+    let rtag = tag.replace("'", "''");
+    for id in ids {
+        query += &format!("{}({}, '{}')", comma, id, rtag);
+        comma = ", ";
+    }
+
+    conn.execute(&query, rusqlite::NO_PARAMS)?;
+    Ok(())
 }

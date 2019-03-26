@@ -26,3 +26,7 @@ regex = "0.2"
 [dependencies.rusqlite]
 version = "0.17.0"
 features = ["bundled"]
+
+[patch.crates-io]
+# needed for fixed terminal size
+termion = { git = "https://gitlab.redox-os.org/xPMo/termion", branch = "tty_size" }

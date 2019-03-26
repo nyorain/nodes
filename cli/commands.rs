@@ -8,27 +8,19 @@ use rusqlite::Connection;
 use clap::value_t;
 
 pub fn rm(conn: &Connection, args: &clap::ArgMatches) -> i32 {
-    let mut query: String = "
-        DELETE FROM nodes
-        WHERE id IN (".to_string();
-    let mut count = 0;
-    let errors = util::operate_ids_stdin(args, "id", |id| {
-        if count != 0 {
-            query += ",";
-        }
-
-        query += &id.to_string();
-        count += 1;
-    });
-
-    if count == 0 {
+    let nodes = util::gather_nodes(&args, "id");
+    if nodes.is_empty() {
         println!("No valid ids given");
         return -1;
     }
 
-    query += ")";
-    let res = conn.execute(&query, rusqlite::NO_PARAMS).unwrap();
-    (count - res) as i32 + errors
+    match util::delete_range(&conn, &nodes) {
+        Ok(num) => (nodes.len() - num) as i32,
+        Err(err) => {
+            eprintln!("{}", err);
+            -2
+        }
+    }
 }
 
 pub fn ls(conn: &Connection, args: &clap::ArgMatches) -> i32 {
@@ -40,7 +32,8 @@ pub fn ls(conn: &Connection, args: &clap::ArgMatches) -> i32 {
 
     // number of nodes to show
     let width = util::terminal_size().0 as usize;
-    util::iter_nodes_args(&conn, &args, false, true, |node| {
+    let args = util::extract_list_args(&args, true, false);
+    util::iter_nodes(&conn, &args, |node| {
         let summary = util::node_summary(&node.content, lines as usize, width);
         if lines == 1 {
             println!("{}:\t{}", node.id, summary)
@@ -117,5 +110,26 @@ pub fn output(conn: &Connection, args: &clap::ArgMatches) -> i32 {
 
 pub fn edit(conn: &Connection, args: &clap::ArgMatches) -> i32 {
     let id = value_t!(args, "id", u32).unwrap_or_else(|e| e.exit());
-    if util::edit(&conn, id) { 0 } else { -1 }
+    if let Err(e) = util::edit(&conn, id) {
+        eprintln!("{}", e);
+        return -6;
+    }
+    0
+}
+
+pub fn add_tag(conn: &Connection, args: &clap::ArgMatches) -> i32 {
+    let tag = args.value_of("tag").unwrap();
+    let nodes = util::gather_nodes(&args, "id");
+    if nodes.is_empty() {
+        println!("No valid ids given");
+        return -1;
+    }
+
+    match util::add_tag(&conn, &nodes, &tag) {
+        Ok(_) => 0,
+        Err(err) => {
+            eprintln!("{}", err);
+            -2
+        }
+    }
 }

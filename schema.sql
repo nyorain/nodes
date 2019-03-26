@@ -20,6 +20,7 @@ CREATE TABLE tags (
 	CONSTRAINT fk_node
 		FOREIGN KEY (node)
 		REFERENCES nodes(id)
+		ON DELETE CASCADE
 );
 
 -- idea: links

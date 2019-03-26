@@ -27,6 +27,8 @@ fn is_node(v: String) -> Result<(), String> {
 }
 
 fn main() -> rusqlite::Result<()> {
+    // TODO:
+    // - archived
     let matches = clap_app!(nodes =>
         (version: "0.1")
         (setting: clap::AppSettings::VersionlessSubcommands)
@@ -45,6 +47,21 @@ fn main() -> rusqlite::Result<()> {
             (@arg id: +multiple index(1) {is_node}
                 "The nodes id. Can also specify multiple nodes.
                 If not given, will read from stdin")
+        ) (@subcommand select =>
+            (about: "Select a list of nodes, ids will be printed to stdout")
+            (alias: "s")
+            (@arg pattern: index(1)
+                "Only list nodes matching this pattern")
+            (@arg num: -n --num +takes_value
+                default_value("999999")
+                {is_uint}
+                "Maximum number of nodes to show")
+            (@arg archived: -a !takes_value !required
+                "Show only archived nodes")
+            (@arg only_archived: -A !takes_value !required
+                "Only show archived nodes")
+            (@arg reverse: -r --rev !takes_value !required
+                "Reverses the node/display order. Default is ascending")
         ) (@subcommand ls =>
             (about: "Lists existing notes")
             (@arg pattern: index(1)
@@ -62,9 +79,9 @@ fn main() -> rusqlite::Result<()> {
             (@arg reverse_display: -r --revdisplay !takes_value !required
                 "Reverses the display order. Default is ascending")
             (@arg archived: -a !takes_value !required
-                "Show only archived nodes")
-            (@arg debug_condition: -d !takes_value !required +hidden
-                "Debug the condition tree")
+                "Include archived nodes")
+            (@arg only_archived: -A !takes_value !required
+                "Only show archived nodes")
         ) (@subcommand output =>
             (about: "Output the content of a node")
             (alias: "o")
@@ -73,24 +90,13 @@ fn main() -> rusqlite::Result<()> {
             (about: "Edits a node")
             (alias: "e")
             (@arg id: +required index(1) {is_node} "Id of node to edit")
-        ) (@subcommand ref =>
-           (@arg ref: +required index(1) "The node reference")
-           (@arg from: index(2)
-                "Origin node path. Needed for 'this' storage")
-           (about: "Resolves a node reference to a path")
-        ) (@subcommand select =>
-            (about: "Select a list of nodes, ids will be printed to stdout")
-            (alias: "s")
-            (@arg pattern: index(1)
-                "Only list nodes matching this pattern")
-            (@arg num: -n --num +takes_value
-                default_value("999999")
-                {is_uint}
-                "Maximum number of nodes to show")
-            (@arg archived: -a !takes_value !required
-                "Show only archived nodes")
-            (@arg reverse: -r --rev !takes_value !required
-                "Reverses the node/display order. Default is ascending")
+        ) (@subcommand addtag =>
+            (about: "Adds a tag to a node")
+            (alias: "at")
+            (@arg id: +multiple index(2) {is_node}
+                "The nodes id. Can also specify multiple nodes.
+                If not given, will read from stdin")
+            (@arg tag: +required index(1) "The tag to add")
         )
     ).get_matches();
 
@@ -126,8 +132,7 @@ fn main() -> rusqlite::Result<()> {
         ("ls", Some(s)) => commands::ls(&conn, s),
         ("select", Some(s)) => select::select(&conn, s),
         ("output", Some(s)) => commands::output(&conn, s),
-        // TODO: default action when just a node id is given
-        // e.g. should `nodes 234` should show/edit that node?
+        ("addtag", Some(s)) => commands::add_tag(&conn, s),
         _ => select::select(&conn, &clap::ArgMatches::default())
     };
 
