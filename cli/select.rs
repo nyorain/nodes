@@ -212,7 +212,9 @@ impl<'a> SelectScreen<'a> {
                 },
                 Key::Char('e') | Key::Char('\n') => { // edit
                     util::edit(&self.conn, self.nodes[self.hover].id).unwrap();
-                    write!(screen, "{}", termion::clear::All).unwrap();
+                    write!(screen, "{}{}",
+                        termion::clear::All,
+                        termion::cursor::Hide).unwrap();
                 },
                 Key::Char(c) if c.is_digit(10) => { // number for action count
                     acount = acount.saturating_mul(10);
@@ -251,6 +253,9 @@ impl<'a> SelectScreen<'a> {
                         }
                     }
                     self.reload_nodes();
+                    write!(screen, "{}{}",
+                        termion::clear::All,
+                        termion::cursor::Hide).unwrap();
                 },
                 // TODO:
                 // - page down/up
@@ -413,8 +418,10 @@ pub fn select(conn: &Connection, args: &clap::ArgMatches) -> i32 {
         // run interactive select/edit screen
         s.run_normal(&mut screen, &mut stdin.keys());
 
-        // show cursor again
-        write!(screen, "{}", termion::cursor::Show).unwrap();
+        // final clear show cursor again
+        write!(screen, "{}{}",
+            termion::clear::All,
+            termion::cursor::Show).unwrap();
     }
 
     // output selected nodes
