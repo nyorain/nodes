@@ -233,8 +233,28 @@ impl<'a> SelectScreen<'a> {
                     self.nodes[self.hover].selected ^= true;
                 },
                 Key::Char('e') | Key::Char('\n') => { // edit
+                    write!(screen, "{}", termion::screen::ToMainScreen).unwrap();
                     util::edit(&self.conn, self.nodes[self.hover].id).unwrap();
-                    write!(screen, "{}{}",
+                    write!(screen, "{}{}{}",
+                        termion::screen::ToAlternateScreen,
+                        termion::clear::All,
+                        termion::cursor::Hide).unwrap();
+                },
+                Key::Char('c') => {
+                    write!(screen, "{}", termion::screen::ToMainScreen).unwrap();
+                    // TODO: display error/id in some kind of status line
+                    // could display it with timeout (like 1 or 2 seconds)
+                    // we wouldn't need an extra thread for that, enough to
+                    // check on user input
+                    match util::create(&self.conn, None) {
+                        Ok(_) => (),
+                        Err(err) => {
+                            eprintln!("{}", err);
+                        }
+                    }
+                    self.reload_nodes();
+                    write!(screen, "{}{}{}",
+                        termion::screen::ToAlternateScreen,
                         termion::clear::All,
                         termion::cursor::Hide).unwrap();
                 },
@@ -261,33 +281,13 @@ impl<'a> SelectScreen<'a> {
                 Key::Char('s') => { // clear selection
                     self.clear_selection();
                 },
-                Key::Char('c') => {
-                    // TODO: display error/id in some kind of status line
-                    // could display it with timeout (like 1 or 2 seconds)
-                    // we wouldn't need an extra thread for that, enough to
-                    // check on user input
-                    match util::create(&self.conn, None) {
-                        Ok(_) => (),
-                        Err(err) => {
-                            eprintln!("{}", err);
-                        }
-                    }
-                    self.reload_nodes();
-                    write!(screen, "{}{}",
-                        termion::clear::All,
-                        termion::cursor::Hide).unwrap();
-                },
                 Key::Char(':') => {
                     self.run_command(screen, keys);
                 },
                 // TODO:
                 // - page down/up
-                // - somehow show tags/some meta field (already in preview?)
-                //   should be configurable
-                //   additionally? edit/show meta file
                 // - allow to open/show multiple at once?
                 //   maybe allow to edit/show selected?
-                // - less-like status bar or something?
                 // - "u": undo?
                 _ => changed = false,
             }
@@ -434,8 +434,8 @@ impl<'a> SelectScreen<'a> {
                     break;
                 },
                 Key::Backspace => {
-                    if self.args.pattern.pop().is_none() {
-                        break;
+                    if command.pop().is_none() {
+                        return;
                     }
                 },
                 Key::Char(c) => {
@@ -448,7 +448,9 @@ impl<'a> SelectScreen<'a> {
         }
 
         // handle command
-        let args: Vec<&str> = command.split(" ").collect();
+        let args: Vec<&str> = command
+            .split(|c| c == ',' || c == ' ')
+            .collect();
         match args[0] {
             "tag" if args.len() > 1 => {
                 let (nodes, _) = self.selection_or_hover();

@@ -43,11 +43,6 @@ pub fn ls(conn: &Connection, args: &clap::ArgMatches) -> i32 {
 
 // TODO: use transaction i guess
 pub fn create(conn: &Connection, args: &clap::ArgMatches) -> i32 {
-    let mut tags = Vec::new();
-    if args.is_present("tags") {
-        tags = args.values_of("tags").unwrap().collect();
-    }
-
     let res = util::create(&conn, args.value_of("content"));
     if let Err(err) = res {
         eprintln!("{}", err);
@@ -55,7 +50,11 @@ pub fn create(conn: &Connection, args: &clap::ArgMatches) -> i32 {
     }
 
     let id = res.unwrap();
-    util::add_tags(&conn, &[id], &tags).unwrap();
+    if args.is_present("tags") {
+        let tags: Vec<&str> = args.values_of("tags").unwrap().collect();
+        util::add_tags(&conn, &[id], &tags).unwrap();
+    }
+
     println!("{}", id);
     0
 }
@@ -85,7 +84,7 @@ pub fn output(conn: &Connection, args: &clap::ArgMatches) -> i32 {
     let query = "
         UPDATE nodes
         SET viewed = CURRENT_TIMESTAMP
-        WHERE id = ?2";
+        WHERE id = ?1";
     conn.execute(query, &[&id]).unwrap();
 
     0
