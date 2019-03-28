@@ -132,6 +132,12 @@ impl<'a> SelectScreen<'a> {
         self.termsize.1
     }
 
+    pub fn clear_selection(&mut self) {
+        for node in &mut self.nodes {
+            node.selected = false;
+        }
+    }
+
     // moves cursor down by n
     pub fn cursor_down(&mut self, n: usize) {
         self.hover = cmp::min(self.nodes.len() - 1, self.hover + n);
@@ -148,6 +154,18 @@ impl<'a> SelectScreen<'a> {
         }
     }
 
+    pub fn selection_or_hover(&self) -> (Vec<u32>, bool) {
+        let selected: Vec<u32> = self.nodes.iter()
+            .filter(|node| node.selected)
+            .map(|node| node.id)
+            .collect();
+        if selected.is_empty() {
+            (vec!(self.nodes[self.hover].id), true)
+        } else {
+            (selected, false)
+        }
+    }
+
     pub fn archive(&mut self) {
         let selected: Vec<u32> = self.nodes.iter()
             .filter(|node| node.selected)
@@ -156,12 +174,16 @@ impl<'a> SelectScreen<'a> {
         if selected.is_empty() {
             let id = self.nodes[self.hover].id;
             util::toggle_archived(&self.conn, id).unwrap();
-            self.nodes.remove(self.hover);
+            if self.args.archived.is_some() {
+                self.nodes.remove(self.hover);
+            }
             return;
         }
 
         util::toggle_archived_range(&self.conn, &selected).unwrap();
-        self.nodes.retain(|node| !node.selected);
+        if self.args.archived.is_some() {
+            self.nodes.retain(|node| !node.selected);
+        }
     }
 
     pub fn run_normal<R: Read, W: Write>(&mut self, screen: &mut W, keys: &mut Keys<R>) {
@@ -237,9 +259,7 @@ impl<'a> SelectScreen<'a> {
                     self.reload_nodes();
                 },
                 Key::Char('s') => { // clear selection
-                    for node in &mut self.nodes {
-                        node.selected = false;
-                    }
+                    self.clear_selection();
                 },
                 Key::Char('c') => {
                     // TODO: display error/id in some kind of status line
@@ -256,6 +276,9 @@ impl<'a> SelectScreen<'a> {
                     write!(screen, "{}{}",
                         termion::clear::All,
                         termion::cursor::Hide).unwrap();
+                },
+                Key::Char(':') => {
+                    self.run_command(screen, keys);
                 },
                 // TODO:
                 // - page down/up
@@ -348,17 +371,10 @@ impl<'a> SelectScreen<'a> {
     pub fn run_delete<R: Read, W: Write>(&mut self, screen: &mut W, keys: &mut Keys<R>) {
         // TODO: could be done more efficiently if we keep track
         // of selected nodes in a `Vec<u32> selected`...
-        let mut delete_hover = false;
+        let (selected, delete_hover) = self.selection_or_hover();
         let mut nodes_description = "selected nodes".to_string();
-        let mut selected: Vec<u32> = self.nodes.iter()
-            .filter(|node| node.selected)
-            .map(|node| node.id)
-            .collect();
-        if selected.is_empty() {
-            let id = self.nodes[self.hover].id;
-            nodes_description = format!("node {}", id);
-            selected = vec!(id);
-            delete_hover = true;
+        if delete_hover {
+            nodes_description = format!("node {}", selected[0]);
         }
 
         // render delete confirmation
@@ -392,6 +408,63 @@ impl<'a> SelectScreen<'a> {
             }
         }
     }
+
+    fn render_command<W: Write>(&self, screen: &mut W, cmd: &str) {
+        write!(screen, "{}{}{}{}:{}",
+            termion::cursor::Goto(1, self.termy()),
+            termion::color::Fg(termion::color::Reset),
+            termion::color::Bg(termion::color::Reset),
+            termion::clear::CurrentLine,
+            cmd).unwrap();
+    }
+
+    // TODO: better specific tagging modes (starting just via 't' in normal mode)
+    // show context-sensitive suggestions, enter will confirm/use them immediately
+    pub fn run_command<R: Read, W: Write>(&mut self, screen: &mut W, keys: &mut Keys<R>) {
+        let mut command = String::new();
+        self.render_command(screen, &command);
+        screen.flush().unwrap();
+
+        for c in keys {
+            match c.unwrap() {
+                Key::Esc | Key::Ctrl('c') | Key::Ctrl('d') => {
+                    return;
+                },
+                Key::Char('\n') => {
+                    break;
+                },
+                Key::Backspace => {
+                    if self.args.pattern.pop().is_none() {
+                        break;
+                    }
+                },
+                Key::Char(c) => {
+                    command.push(c);
+                    self.render_command(screen, &command);
+                    screen.flush().unwrap();
+                },
+                _ => (),
+            }
+        }
+
+        // handle command
+        let args: Vec<&str> = command.split(" ").collect();
+        match args[0] {
+            "tag" if args.len() > 1 => {
+                let (nodes, _) = self.selection_or_hover();
+                util::add_tags(&self.conn, &nodes, &args[1..]).unwrap();
+                self.clear_selection();
+                self.reload_nodes();
+            },
+            "untag" if args.len() > 1 => {
+                let (nodes, _) = self.selection_or_hover();
+                util::remove_tags(&self.conn, &nodes, &args[1..]).unwrap();
+                self.clear_selection();
+                self.reload_nodes();
+            },
+            _ => (), // Invalid
+        }
+    }
 }
 
 pub fn select(conn: &Connection, args: &clap::ArgMatches) -> i32 {
@@ -419,8 +492,9 @@ pub fn select(conn: &Connection, args: &clap::ArgMatches) -> i32 {
         s.run_normal(&mut screen, &mut stdin.keys());
 
         // final clear show cursor again
-        write!(screen, "{}{}",
+        write!(screen, "{}{}{}",
             termion::clear::All,
+            termion::cursor::Goto(1, 1),
             termion::cursor::Show).unwrap();
     }
 

@@ -45,7 +45,7 @@ fn main() -> rusqlite::Result<()> {
         ) (@subcommand rm =>
             (about: "Removes a node (by id)")
             (@arg id: +multiple index(1) {is_node}
-                "The nodes id. Can also specify multiple nodes.
+                "The node ids. Can also specify multiple nodes. \
                 If not given, will read from stdin")
         ) (@subcommand select =>
             (about: "Select a list of nodes, ids will be printed to stdout")
@@ -89,14 +89,27 @@ fn main() -> rusqlite::Result<()> {
         ) (@subcommand edit =>
             (about: "Edits a node")
             (alias: "e")
-            (@arg id: +required index(1) {is_node} "Id of node to edit")
+            (@arg id: --id +required index(1) {is_node} "Id of node to edit")
         ) (@subcommand addtag =>
             (about: "Adds a tag to a node")
             (alias: "at")
-            (@arg id: +multiple index(2) {is_node}
-                "The nodes id. Can also specify multiple nodes.
-                If not given, will read from stdin")
             (@arg tag: +required index(1) "The tag to add")
+            (@arg id: +multiple index(2) {is_node}
+                "The node ids. Can also specify multiple nodes. \
+                If not given, will read from stdin")
+        ) (@subcommand rmtag =>
+            (about: "Adds a tag to a node")
+            (alias: "rt")
+            (@arg tag: +required index(1) "The tag to remove")
+            (@arg id: +multiple index(2) {is_node}
+                "The node ids. Can also specify multiple nodes. \
+                If not given, will read from stdin")
+        ) (@subcommand archive =>
+           (about: "Toggles the archived state of a node")
+           (alias: "a")
+           (@arg id: +multiple index(1) {is_node}
+                "The node ids. Can also specify multiple nodes. \
+                If not given, will read from stdin")
         )
     ).get_matches();
 
@@ -133,6 +146,8 @@ fn main() -> rusqlite::Result<()> {
         ("select", Some(s)) => select::select(&conn, s),
         ("output", Some(s)) => commands::output(&conn, s),
         ("addtag", Some(s)) => commands::add_tag(&conn, s),
+        ("rmtag", Some(s)) => commands::remove_tag(&conn, s),
+        ("archive", Some(s)) => commands::archive(&conn, s),
         _ => select::select(&conn, &clap::ArgMatches::default())
     };
 

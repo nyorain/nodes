@@ -1,11 +1,7 @@
 use super::util;
 
-use std::io::prelude::*;
-use std::process;
-use tempfile::NamedTempFile;
-
 use rusqlite::Connection;
-use clap::value_t;
+use clap::{value_t, values_t};
 
 pub fn rm(conn: &Connection, args: &clap::ArgMatches) -> i32 {
     let nodes = util::gather_nodes(&args, "id");
@@ -45,17 +41,23 @@ pub fn ls(conn: &Connection, args: &clap::ArgMatches) -> i32 {
     0
 }
 
+// TODO: use transaction i guess
 pub fn create(conn: &Connection, args: &clap::ArgMatches) -> i32 {
-    match util::create(&conn, args.value_of("content")) {
-        Ok(id) => {
-            println!("{}", id);
-            0
-        }
-        Err(err) => {
-            eprintln!("{}", err);
-            -2
-        }
+    let mut tags = Vec::new();
+    if args.is_present("tags") {
+        tags = args.values_of("tags").unwrap().collect();
     }
+
+    let res = util::create(&conn, args.value_of("content"));
+    if let Err(err) = res {
+        eprintln!("{}", err);
+        return -2;
+    }
+
+    let id = res.unwrap();
+    util::add_tags(&conn, &[id], &tags).unwrap();
+    println!("{}", id);
+    0
 }
 
 pub fn output(conn: &Connection, args: &clap::ArgMatches) -> i32 {
@@ -99,14 +101,47 @@ pub fn edit(conn: &Connection, args: &clap::ArgMatches) -> i32 {
 }
 
 pub fn add_tag(conn: &Connection, args: &clap::ArgMatches) -> i32 {
-    let tag = args.value_of("tag").unwrap();
+    let tags: Vec<&str> = args.values_of("tag").unwrap().collect();
     let nodes = util::gather_nodes(&args, "id");
     if nodes.is_empty() {
         println!("No valid ids given");
         return -1;
     }
 
-    match util::add_tag(&conn, &nodes, &tag) {
+    match util::add_tags(&conn, &nodes, &tags) {
+        Ok(_) => 0,
+        Err(err) => {
+            eprintln!("{}", err);
+            -2
+        }
+    }
+}
+
+pub fn remove_tag(conn: &Connection, args: &clap::ArgMatches) -> i32 {
+    let tags: Vec<&str> = args.values_of("tag").unwrap().collect();
+    let nodes = util::gather_nodes(&args, "id");
+    if nodes.is_empty() {
+        println!("No valid ids given");
+        return -1;
+    }
+
+    match util::remove_tags(&conn, &nodes, &tags) {
+        Ok(_) => 0,
+        Err(err) => {
+            eprintln!("{}", err);
+            -2
+        }
+    }
+}
+
+pub fn archive(conn: &Connection, args: &clap::ArgMatches) -> i32 {
+    let nodes = util::gather_nodes(&args, "id");
+    if nodes.is_empty() {
+        println!("No valid ids given");
+        return -1;
+    }
+
+    match util::toggle_archived_range(&conn, &nodes) {
         Ok(_) => 0,
         Err(err) => {
             eprintln!("{}", err);

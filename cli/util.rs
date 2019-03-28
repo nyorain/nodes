@@ -423,14 +423,45 @@ pub fn delete(conn: &Connection, id: u32) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn add_tag(conn: &Connection, ids: &[u32], tag: &str) -> Result<(), Error> {
+pub fn add_tags<S: AsRef<str>>(conn: &Connection, ids: &[u32], tags: &[S])
+        -> Result<(), Error> {
     let mut query = "INSERT INTO tags(node, tag) VALUES ".to_string();
     let mut comma = "";
-    let rtag = tag.replace("'", "''");
+    let rtags: Vec<String> = tags.iter()
+        .map(|t| t.as_ref().replace("'", "''"))
+        .collect();
     for id in ids {
-        query += &format!("{}({}, '{}')", comma, id, rtag);
+        for tag in &rtags {
+            query += &format!("{}({}, '{}')", comma, id, tag);
+            comma = ", ";
+        }
+    }
+
+    conn.execute(&query, rusqlite::NO_PARAMS)?;
+    Ok(())
+}
+
+pub fn remove_tags<S: AsRef<str>>(conn: &Connection, ids: &[u32], tags: &[S])
+        -> Result<(), Error> {
+    let mut query = "DELETE FROM tags WHERE ".to_string();
+    let mut comma = "";
+
+    query += "node IN (";
+    for id in ids {
+        query += &format!("{}{}", comma, id);
         comma = ", ";
     }
+
+    query += ") AND tag IN (";
+    comma = "";
+    let rtags: Vec<String> = tags.iter()
+        .map(|t| t.as_ref().replace("'", "''"))
+        .collect();
+    for tag in &rtags {
+        query += &format!("{}'{}'", comma, tag);
+        comma = ", ";
+    }
+    query += ")";
 
     conn.execute(&query, rusqlite::NO_PARAMS)?;
     Ok(())
