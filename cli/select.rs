@@ -493,6 +493,7 @@ pub fn select(conn: &Connection, args: &clap::ArgMatches) -> i32 {
         // run interactive select/edit screen
         s.run_normal(&mut screen, &mut stdin.keys());
 
+        // TODO: do this cleanup in Drop to also execute in on panic
         // final clear show cursor again
         write!(screen, "{}{}{}",
             termion::clear::All,

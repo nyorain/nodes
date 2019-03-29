@@ -16,7 +16,6 @@ path = "cli/main.rs"
 time = "0.1"
 clap = "2.30"
 termion = "1.5"
-nom = "^4.2"
 tempfile = "3"
 dirs = "1.0"
 toml = "0.5"
@@ -26,6 +25,10 @@ regex = "0.2"
 [dependencies.rusqlite]
 version = "0.17.0"
 features = ["bundled"]
+
+[dependencies.nom]
+version = "^4.2"
+features = ["verbose-errors"]
 
 [patch.crates-io]
 # needed for fixed terminal size

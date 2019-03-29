@@ -215,12 +215,19 @@ pub fn iter_nodes<F: FnMut(&Node)>(conn: &Connection,
     }
 
     if !args.pattern.is_empty() {
-        // escape for sql
-        let pattern = args.pattern.to_string().replace("'", "''");
-        qwhere = format!("{} {}
-            (content LIKE '%{p}%' OR tag LIKE '%{p}%')",
-            qwhere, where_add, p = pattern);
+        // TODO: don't unwrap here!
+        let pattern = nodes::pattern::parse_condition(&args.pattern).unwrap();
+        let pattern = nodes::pattern::tosql(&pattern);
+        eprintln!("{}", &pattern);
+        qwhere = format!("{} {} {}", qwhere, where_add, pattern);
         where_add = "AND";
+
+        // escape for sql
+        // let pattern = args.pattern.to_string().replace("'", "''");
+        // qwhere = format!("{} {}
+        //     (content LIKE '%{p}%' OR tag LIKE '%{p}%')",
+        //     qwhere, where_add, p = pattern);
+        // where_add = "AND";
     }
 
     let mut qlimit = String::new();
