@@ -5,6 +5,7 @@ use std::error;
 use std::fmt;
 
 use clap::{values_t, value_t};
+use nodes::pattern;
 
 use rusqlite::{Connection, ToSql};
 use tempfile::NamedTempFile;
@@ -192,7 +193,7 @@ pub struct ListArgs {
     pub preorder: Order,
     pub postorder: Order,
     pub count: Option<usize>,
-    pub pattern: String, // empty for no pattern
+    pub pattern: Option<pattern::CondNode>,
     pub archived: Option<bool>,
 }
 
@@ -214,20 +215,10 @@ pub fn iter_nodes<F: FnMut(&Node)>(conn: &Connection,
         where_add = "AND";
     }
 
-    if !args.pattern.is_empty() {
-        // TODO: don't unwrap here!
-        let pattern = nodes::pattern::parse_condition(&args.pattern).unwrap();
+    if let Some(pattern) = &args.pattern {
         let pattern = nodes::pattern::tosql(&pattern);
-        eprintln!("{}", &pattern);
         qwhere = format!("{} {} {}", qwhere, where_add, pattern);
         where_add = "AND";
-
-        // escape for sql
-        // let pattern = args.pattern.to_string().replace("'", "''");
-        // qwhere = format!("{} {}
-        //     (content LIKE '%{p}%' OR tag LIKE '%{p}%')",
-        //     qwhere, where_add, p = pattern);
-        // where_add = "AND";
     }
 
     let mut qlimit = String::new();
@@ -287,10 +278,18 @@ pub fn extract_list_args<'a>(args: &'a clap::ArgMatches, mut reverse: bool,
         Some(false)
     };
 
+    let pattern = match args.value_of("pattern").map(pattern::parse_condition) {
+        Some(Ok(cond)) => Some(cond),
+        Some(Err(_)) => {
+            eprintln!("Invalid pattern");
+            None
+        }, None => None,
+    };
+
     ListArgs {
         preorder: if reverse { Order::Desc } else { Order::Asc },
         postorder: if reverse_display { Order::Desc } else { Order::Asc },
-        pattern: args.value_of("pattern").unwrap_or("").to_string(),
+        pattern: pattern,
         count: limit,
         archived: archived,
     }

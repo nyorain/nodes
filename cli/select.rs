@@ -1,4 +1,5 @@
 use super::util;
+use nodes::pattern;
 
 use std::cmp;
 use std::io;
@@ -27,6 +28,7 @@ struct SelectScreen<'a> {
     hover: usize, // index of node the cursor is over
     start: usize, // in of first node currently displayed
     termsize: (u16, u16), // TODO: handle SIGWINCH as resize handler
+    pattern: String, // current search filter
 }
 
 const FG_RESET: termion::color::Fg<termion::color::Reset> =
@@ -42,7 +44,8 @@ impl<'a> SelectScreen<'a> {
             nodes: Vec::new(),
             hover: 0,
             start: 0,
-            termsize: util::terminal_size()
+            termsize: util::terminal_size(),
+            pattern: String::new(),
         };
 
         s.reload_nodes();
@@ -65,6 +68,25 @@ impl<'a> SelectScreen<'a> {
             });
         });
         self.nodes = nodes;
+    }
+
+    pub fn reparse_pattern(&mut self) -> bool {
+        if self.pattern.is_empty() {
+            let changed = self.args.pattern.is_some();
+            self.args.pattern = None;
+            return changed;
+        }
+
+        match pattern::parse_condition(&self.pattern) {
+            Err(_) => {
+                // TODO: log invalid pattern? show it somewhere?
+                // some kind of visual feedback? maybe merk it red?
+                false
+            }, Ok(pattern) => {
+                self.args.pattern = Some(pattern);
+                true
+            }
+        }
     }
 
     pub fn write_nodes<W: Write>(&mut self, screen: &mut W) {
@@ -314,7 +336,7 @@ impl<'a> SelectScreen<'a> {
             termion::color::Fg(termion::color::Reset),
             termion::color::Bg(termion::color::Reset),
             termion::clear::CurrentLine,
-            self.args.pattern).unwrap();
+            self.pattern).unwrap();
     }
 
     pub fn run_search<R: Read, W: Write>(&mut self, screen: &mut W, keys: &mut Keys<R>) {
@@ -330,33 +352,36 @@ impl<'a> SelectScreen<'a> {
             match c.unwrap() {
                 Key::Esc | Key::Ctrl('c') | Key::Ctrl('d') => {
                     end = true;
-                    self.args.pattern.clear();
+                    self.pattern.clear();
                 },
                 Key::Char('\n') => {
                     end = true;
                     changed = false;
                 },
                 Key::Backspace => {
-                    if self.args.pattern.pop().is_none() {
+                    if self.pattern.pop().is_none() {
                         end = true;
                         changed = false;
                     }
                 },
                 Key::Char(c) => {
-                    self.args.pattern.push(c);
+                    self.pattern.push(c);
                 },
                 _ => changed = false,
             }
 
             if changed {
-                // TODO: we could theoretically track them/jump to
-                // nearest node
-                self.hover = 0;
-                self.start = 0;
+                if self.reparse_pattern() {
+                    // TODO: we could theoretically track them/jump to
+                    // nearest node
+                    self.hover = 0;
+                    self.start = 0;
 
-                write!(screen, "{}", termion::clear::All).unwrap();
-                self.reload_nodes();
-                self.write_nodes(screen);
+                    write!(screen, "{}", termion::clear::All).unwrap();
+                    self.reload_nodes();
+                    self.write_nodes(screen);
+                }
+
                 self.render_search(screen);
                 screen.flush().unwrap();
             }

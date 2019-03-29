@@ -31,7 +31,7 @@ pub enum CondNodeType {
     TagMatch(String),
 }
 
-type CondNode = Node<CondNodeType>;
+pub type CondNode = Node<CondNodeType>;
 
 // to sql
 pub fn tosql(pattern: &CondNode) -> String {
@@ -49,9 +49,9 @@ pub fn tosql(pattern: &CondNode) -> String {
                 query += &tosql(c);
 
                 sep = if let CondNodeType::And = pattern.data {
-                    "AND "
+                    " AND "
                 } else {
-                    "OR "
+                    " OR "
                 }
             }
             query += ")";
@@ -83,20 +83,20 @@ pub fn tosql(pattern: &CondNode) -> String {
     query
 }
 
-// parser
-// TODO: allow escaped values again (e.g. in [x])?
-named!(value_string_unesc, is_not!("|&()[]<>/"));
-named!(value_string_esc,
-    delimited!(tag!("\""), take_until!("\""), tag!("\"")));
-named!(value_string<&str>, map_res!(
-    alt_complete!(value_string_esc | value_string_unesc),
-    str::from_utf8));
+use nom::types::CompleteStr as Input;
 
-named!(atom<CondNode>, alt_complete!(
+// parser
+named!(value_string_unesc<Input, Input>, is_not!("|&()[]<>/"));
+named!(value_string_esc<Input, Input>,
+    delimited!(tag!("\""), is_not!("\""), tag!("\"")));
+named!(value_string<Input, Input>,
+    alt_complete!(value_string_esc | value_string_unesc));
+
+named!(atom<Input, CondNode>, ws!(alt_complete!(
     // contains full tag
     map!(delimited!(
             tag!("["),
-            map_res!(is_not!("]"), str::from_utf8),
+            is_not!("]"),
             tag!("]")),
         |value| CondNode {
             children: Vec::new(),
@@ -106,7 +106,7 @@ named!(atom<CondNode>, alt_complete!(
             tag!("t"),
             delimited!(
                 tag!("("),
-                map_res!(is_not!(")"), str::from_utf8),
+                is_not!(")"),
                 tag!(")"))),
         |value| CondNode {
             children: Vec::new(),
@@ -115,7 +115,7 @@ named!(atom<CondNode>, alt_complete!(
     // containts a tag that matches string
     map!(delimited!(
             tag!("<"),
-            map_res!(is_not!(">"), str::from_utf8),
+            is_not!(">"),
             tag!(">")),
         |value| CondNode {
             children: Vec::new(),
@@ -125,7 +125,7 @@ named!(atom<CondNode>, alt_complete!(
             tag!("t"),
             delimited!(
                 tag!("/"),
-                map_res!(is_not!("/"), str::from_utf8),
+                is_not!("/"),
                 tag!("/"))),
         |value| CondNode {
             children: Vec::new(),
@@ -136,7 +136,7 @@ named!(atom<CondNode>, alt_complete!(
             tag!("c"),
             delimited!(
                 tag!("("),
-                map_res!(is_not!(")"), str::from_utf8),
+                is_not!(")"),
                 tag!(")"))),
         |value| CondNode {
             children: Vec::new(),
@@ -148,37 +148,23 @@ named!(atom<CondNode>, alt_complete!(
              children: Vec::new(),
              data: CondNodeType::Match(value.to_string()),
     })
-));
+)));
 
-named!(expr<CondNode>, alt_complete!(
-    delimited!(tag!("("), and, tag!(")")) |
+named!(expr<Input, CondNode>, alt_complete!(
+    ws!(delimited!(tag!("("), or, tag!(")"))) |
     atom
 ));
 
-named!(not<CondNode>, alt_complete!(map!(
+named!(not<Input, CondNode>, alt_complete!(ws!(map!(
         preceded!(tag!("!"), expr),
         |expr| CondNode {
             children: vec!(expr),
             data: CondNodeType::Not
-        }) |
+        })) |
     expr));
 
-named!(or<CondNode>, map!(
-    separated_nonempty_list_complete!(tag!("|"), not),
-    |mut children| {
-        if children.len() == 1 {
-            children.pop().unwrap()
-        } else {
-            CondNode {
-                children,
-                data: CondNodeType::Or,
-            }
-        }
-    }
-));
-
-named!(and<CondNode>, map!(
-    separated_nonempty_list_complete!(tag!("&"), or),
+named!(and<Input, CondNode>, ws!(map!(
+    separated_nonempty_list_complete!(tag!("&"), not),
     |mut children| {
         if children.len() == 1 {
             children.pop().unwrap()
@@ -189,28 +175,35 @@ named!(and<CondNode>, map!(
             }
         }
     }
-));
+)));
 
-pub fn parse_condition(pattern: &str) -> Result<CondNode, String> {
-    eprintln!("pattern: {}", pattern);
-    let input = pattern.as_bytes();
-    let res = and(input);
+named!(or<Input, CondNode>, ws!(map!(
+    separated_nonempty_list_complete!(tag!("|"), and),
+    |mut children| {
+        if children.len() == 1 {
+            children.pop().unwrap()
+        } else {
+            CondNode {
+                children,
+                data: CondNodeType::Or,
+            }
+        }
+    }
+)));
+
+
+pub fn parse_condition(spattern: &str) -> Result<CondNode, String> {
+    let res = or(Input(&spattern));
 
     if res.is_err() {
-        nom::print_error(input, res);
+        // nom::print_error(pattern.as_bytes(), res);
         return Err("Invalid pattern".to_string());
     }
 
     let (rest, value) = res.unwrap();
     if rest.len() > 0 {
-        // TODO: performance?
-        let str = match str::from_utf8(rest) {
-            Ok(a) => a,
-            Err(_) => return Err("Invalid condition: non-utf8 \
-                input sequence".to_string()),
-        };
         Err(format!("Unexpected character {}",
-            str.chars().next().unwrap()))
+            rest.chars().next().unwrap()))
     } else {
         Ok(value)
     }
