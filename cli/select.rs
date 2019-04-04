@@ -5,17 +5,16 @@ use std::{cmp, io, thread};
 use std::sync::{Mutex, Arc};
 use std::io::prelude::*;
 use std::io::BufWriter;
+use std::time::Duration;
 
 use termion::event::Key;
-use termion::input::Keys;
-use termion::screen::*;
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
 
-use signal_hook::{iterator::Signals, SIGWINCH};
 use rusqlite::Connection;
 use scopeguard::defer;
 
+#[derive(Clone)]
 struct SelectNode {
     id: u32,
     summary: String,
@@ -251,8 +250,8 @@ impl<W: Write> SelectScreen<W> {
         }
     }
 
-    pub fn resized(&mut self) {
-        self.termsize = util::terminal_size();
+    pub fn resized(&mut self, size: (u16, u16)) {
+        self.termsize = size;
         self.render();
     }
 
@@ -558,30 +557,54 @@ impl<W: Write> SelectScreen<W> {
     }
 }
 
+// NOTE: probably cleaner implementation using channels...
 pub fn select(conn: &Connection, args: &clap::ArgMatches) -> i32 {
+    let nodes: Vec<SelectNode>;
+
+    // when scope exits the terminal was restored
     // setup terminal
-    let stdin = io::stdin();
-    let raw = match termion::get_tty().and_then(|tty| tty.into_raw_mode()) {
-        Ok(r) => r,
-        Err(err) => {
-            println!("Failed to transform tty into raw mode: {}", err);
-            return -2;
-        }
-    };
-
-    // set up screen
-    // let ascreen = AlternateScreen::from(raw);
-    // let mut screen = BufWriter::new(ascreen);
-    let mut screen = BufWriter::new(raw);
-    if let Err(err) = write!(screen, "{}", termion::cursor::Hide) {
-        println!("Failed to hide cursor in selection screen: {}", err);
-        return -3;
-    }
-
-    let ms = Arc::new(Mutex::new(SelectScreen::new(&conn, &args, screen)));
-
-    // signal handler
     {
+        let stdin = io::stdin();
+        let raw = match termion::get_tty().and_then(|tty| tty.into_raw_mode()) {
+            Ok(r) => r,
+            Err(err) => {
+                println!("Failed to transform tty into raw mode: {}", err);
+                return -2;
+            }
+        };
+
+        // set up screen
+        // let ascreen = AlternateScreen::from(raw);
+        // let mut screen = BufWriter::new(ascreen);
+        let mut screen = BufWriter::new(raw);
+        if let Err(err) = write!(screen, "{}", termion::cursor::Hide) {
+            println!("Failed to hide cursor in selection screen: {}", err);
+            return -3;
+        }
+
+        let ms = Arc::new(Mutex::new(SelectScreen::new(&conn, &args, screen)));
+        use std::sync::atomic;
+        let run_size = Arc::new(atomic::AtomicBool::new(true));
+
+        let trun_size = run_size.clone();
+        let tms = ms.clone();
+
+        // TODO: use signal again...
+        let sizet = thread::spawn(move || {
+            let mut termsize = util::terminal_size();
+            while trun_size.load(atomic::Ordering::SeqCst) {
+                let ntermsize = util::terminal_size();
+                if ntermsize != termsize {
+                    termsize = ntermsize;
+                    let mut s = tms.lock().unwrap();
+                    s.resized(termsize);
+                }
+
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        // make sure terminal is cleaned up
         defer!{{
             let mut screen = ms.lock().unwrap();
             write!(screen.screen, "{}{}{}{}",
@@ -593,19 +616,6 @@ pub fn select(conn: &Connection, args: &clap::ArgMatches) -> i32 {
             screen.screen.flush().unwrap();
         }};
 
-        let tms = ms.clone();
-        let t = thread::spawn(move || {
-            let signals = Signals::new(&[SIGWINCH]).unwrap();
-            for sig in signals.forever() {
-                if sig == SIGWINCH {
-                    // sigsender.send(Message::Resized).unwrap();
-                    let mut s = tms.lock().unwrap();
-                    eprintln!("resizing");
-                    s.resized();
-                }
-            }
-        });
-
         let keys = stdin.keys();
         for c in keys {
             let c = c.unwrap();
@@ -614,11 +624,15 @@ pub fn select(conn: &Connection, args: &clap::ArgMatches) -> i32 {
                 break;
             }
         }
+
+        // we join the thread so that the terminal is converted back
+        run_size.store(false, atomic::Ordering::SeqCst);
+        sizet.join().unwrap();
+        nodes = ms.lock().unwrap().nodes.clone();
     }
 
     // output selected nodes
-    let mut s = ms.lock().unwrap();
-    for node in &s.nodes {
+    for node in nodes {
         if node.selected {
             println!("{}", node.id);
         }

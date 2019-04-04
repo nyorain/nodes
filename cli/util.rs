@@ -128,12 +128,13 @@ pub fn node_summary(node: &str, mut lines: usize, width: usize) -> String {
 
 /// Returns the current width of the terminal in characters.
 pub fn terminal_size() -> (u16, u16) {
-    // problem: when stdin isn't /dev/tty
-    // let tty = fs::File::open("/dev/tty").unwrap();
-    // TODO: https://github.com/redox-os/termion/blob/master/src/sys/unix/size.rs
     match termion::terminal_size() {
         Ok((x,y)) => (x,y),
-        _ => (80, 80) // guess
+        _ => {
+            // TODO
+            eprintln!("failed to retrieve terminal size");
+            (80, 80) // guess
+        }
     }
 }
 
