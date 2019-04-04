@@ -1,8 +1,8 @@
 use super::util;
 use nodes::pattern;
 
-use std::cmp;
-use std::io;
+use std::{cmp, io, thread};
+use std::sync::{mpsc::sync_channel, Mutex};
 use std::io::prelude::*;
 use std::io::BufWriter;
 
@@ -11,6 +11,8 @@ use termion::input::Keys;
 use termion::screen::*;
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
+
+use signal_hook::{iterator::Signals, SIGWINCH};
 
 use rusqlite::Connection;
 
@@ -21,14 +23,44 @@ struct SelectNode {
     tags: Vec<String>,
 }
 
-struct SelectScreen<'a> {
-    conn: &'a Connection,
+#[derive(Default)]
+struct NormalState {
+    action_count: usize,
+    gpending: bool,
+}
+
+#[derive(Default)]
+struct DeleteState {
+    selection: Vec<u32>,
+    delete_hover: bool,
+}
+
+#[derive(Default)]
+struct CommandState {
+    command: String,
+}
+
+enum State {
+    Normal(NormalState),
+    Search,
+    Command(CommandState),
+    Delete(DeleteState)
+}
+
+struct SelectScreen<'a, W: Write> {
     args: util::ListArgs, // invariant: pattern always Some
     nodes: Vec<SelectNode>,
     hover: usize, // index of node the cursor is over
     start: usize, // in of first node currently displayed
     termsize: (u16, u16), // TODO: handle SIGWINCH as resize handler
     pattern: String, // current search filter
+    state: State,
+    screen: &'a mut W,
+}
+
+enum Message {
+    InputKey(Key),
+    Resized
 }
 
 const FG_RESET: termion::color::Fg<termion::color::Reset> =
@@ -36,28 +68,33 @@ const FG_RESET: termion::color::Fg<termion::color::Reset> =
 const BG_RESET: termion::color::Bg<termion::color::Reset> =
     termion::color::Bg(termion::color::Reset);
 
-impl<'a> SelectScreen<'a> {
-    pub fn new(conn: &'a Connection, args: &clap::ArgMatches) -> SelectScreen<'a> {
+impl<'a, W: Write> SelectScreen<'a, W> {
+    pub fn new(conn: &Connection, args: &clap::ArgMatches, screen: &'a mut W)
+            -> SelectScreen<'a, W> {
+
         let mut s = SelectScreen {
-            conn: &conn,
             args: util::extract_list_args(&args, true, true),
             nodes: Vec::new(),
             hover: 0,
             start: 0,
             termsize: util::terminal_size(),
             pattern: String::new(),
+            state: State::Normal(NormalState::default()),
+            screen: screen,
         };
 
-        s.reload_nodes();
+        // initial load and render
+        s.reload_nodes(conn);
+        s.render();
         s
     }
 
-    pub fn reload_nodes(&mut self) {
+    pub fn reload_nodes(&mut self, conn: &Connection) {
         let termsize = util::terminal_size();
         let width = (termsize.0 - 8) as usize;
 
         let mut nodes = Vec::new();
-        util::iter_nodes(&self.conn, &self.args, |node| {
+        util::iter_nodes(conn, &self.args, |node| {
             let summary = util::node_summary(&node.content, 1, width);
             let tags = node.tags.iter().map(|s| s.to_string()).collect();
             nodes.push(SelectNode{
@@ -89,7 +126,8 @@ impl<'a> SelectScreen<'a> {
         }
     }
 
-    pub fn write_nodes<W: Write>(&mut self, screen: &mut W) {
+    // renders without flush
+    pub fn render_nf(&mut self) {
         let bg_current = termion::color::Bg(termion::color::LightGreen);
         let fg_selected = termion::color::Fg(termion::color::LightRed);
         let x = 1;
@@ -102,15 +140,15 @@ impl<'a> SelectScreen<'a> {
             }
 
             if i == self.hover {
-                write!(screen, "{}", bg_current).unwrap();
+                write!(self.screen, "{}", bg_current).unwrap();
             } else {
-                write!(screen, "{}", BG_RESET).unwrap();
+                write!(self.screen, "{}", BG_RESET).unwrap();
             }
 
             if node.selected {
-                write!(screen, "{}", fg_selected).unwrap();
+                write!(self.screen, "{}", fg_selected).unwrap();
             } else {
-                write!(screen, "{}", FG_RESET).unwrap();
+                write!(self.screen, "{}", FG_RESET).unwrap();
             }
 
             let idstr = node.id.to_string();
@@ -128,7 +166,7 @@ impl<'a> SelectScreen<'a> {
                 tags = "[".to_string() + &node.tags.join("][") + "]";
             }
 
-            write!(screen, "{}{}{}: {:<sw$}  {:>tw$}",
+            write!(self.screen, "{}{}{}: {:<sw$}  {:>tw$}",
                 termion::cursor::Goto(x, y),
                 termion::clear::CurrentLine,
                 node.id, node.summary, tags,
@@ -139,11 +177,23 @@ impl<'a> SelectScreen<'a> {
         }
 
         if y < self.termy() {
-            write!(screen, "{}{}{}{}",
+            write!(self.screen, "{}{}{}{}",
                 termion::cursor::Goto(x, y + 1),
                 BG_RESET, FG_RESET,
                 termion::clear::AfterCursor).unwrap();
         }
+
+        match &self.state {
+            State::Command(state) => self.render_command(&state),
+            State::Delete(state) => self.render_delete(&state),
+            State::Search => self.render_search(),
+            _ => (),
+        };
+    }
+
+    pub fn render(&mut self) {
+        self.render_nf();
+        self.screen.flush().unwrap();
     }
 
     pub fn termx(&self) -> u16 {
@@ -177,6 +227,8 @@ impl<'a> SelectScreen<'a> {
     }
 
     pub fn selection_or_hover(&self) -> (Vec<u32>, bool) {
+        // TODO: could be done more efficiently if we keep track
+        // of selected nodes in a `Vec<u32> selected`...
         let selected: Vec<u32> = self.nodes.iter()
             .filter(|node| node.selected)
             .map(|node| node.id)
@@ -188,309 +240,335 @@ impl<'a> SelectScreen<'a> {
         }
     }
 
-    pub fn archive(&mut self) {
+    pub fn archive(&mut self, conn: &Connection) {
         let selected: Vec<u32> = self.nodes.iter()
             .filter(|node| node.selected)
             .map(|node| node.id)
             .collect();
         if selected.is_empty() {
             let id = self.nodes[self.hover].id;
-            util::toggle_archived(&self.conn, id).unwrap();
+            util::toggle_archived(conn, id).unwrap();
             if self.args.archived.is_some() {
                 self.nodes.remove(self.hover);
             }
             return;
         }
 
-        util::toggle_archived_range(&self.conn, &selected).unwrap();
+        util::toggle_archived_range(conn, &selected).unwrap();
         if self.args.archived.is_some() {
             self.nodes.retain(|node| !node.selected);
         }
     }
 
-    pub fn run_normal<R: Read, W: Write>(&mut self, screen: &mut W, keys: &mut Keys<R>) {
-        let mut gpending = false;
-        let mut acount: usize = 0; // action count
+    pub fn resized(&mut self) {
+        self.termsize = util::terminal_size();
+        self.render();
+    }
 
-        // initial render
-        self.write_nodes(screen);
-        screen.flush().unwrap();
-
-        // react to input
-        loop {
-            let c = keys.next().unwrap();
-
-            let mut reset_acount = true;
-            let mut reset_gpending = true;
-            let mut changed = true;
-            match c.unwrap() {
-                Key::Char('q') => { // quit
-                    break;
-                }
-                Key::Char('j') | Key::Down => { // down
-                    self.cursor_down(cmp::max(acount, 1));
-                },
-                Key::Char('k') | Key::Up => { // up
-                    self.cursor_up(cmp::max(acount, 1));
-                },
-                Key::Char('G') | Key::End => { // end of list
-                    self.hover = self.nodes.len() - 1;
-                    self.start = self.hover.saturating_sub(
-                        (self.termy() - 1) as usize);
-                },
-                Key::Home => { // beginning of list, like gg
-                    self.start = 0;
-                    self.hover = 0;
-                },
-                Key::Char('g') => { // beginning of list; gg detection
-                    if gpending {
-                        self.start = 0;
-                        self.hover = 0;
-                    } else {
-                        gpending = true;
-                        reset_gpending = false;
-                    }
-                },
-                Key::Char(' ') => { // toggle selection
-                    self.nodes[self.hover].selected ^= true;
-                },
-                Key::Char('e') | Key::Char('\n') => { // edit
-                    write!(screen, "{}", termion::screen::ToMainScreen).unwrap();
-                    util::edit(&self.conn, self.nodes[self.hover].id).unwrap();
-                    write!(screen, "{}{}{}",
-                        termion::screen::ToAlternateScreen,
-                        termion::clear::All,
-                        termion::cursor::Hide).unwrap();
-                },
-                Key::Char('c') => {
-                    write!(screen, "{}", termion::screen::ToMainScreen).unwrap();
-                    // TODO: display error/id in some kind of status line
-                    // could display it with timeout (like 1 or 2 seconds)
-                    // we wouldn't need an extra thread for that, enough to
-                    // check on user input
-                    match util::create(&self.conn, None) {
-                        Ok(_) => (),
-                        Err(err) => {
-                            eprintln!("{}", err);
-                        }
-                    }
-                    self.reload_nodes();
-                    write!(screen, "{}{}{}",
-                        termion::screen::ToAlternateScreen,
-                        termion::clear::All,
-                        termion::cursor::Hide).unwrap();
-                },
-                Key::Char(c) if c.is_digit(10) => { // number for action count
-                    acount = acount.saturating_mul(10);
-                    acount = acount.saturating_add(c.to_digit(10).unwrap() as usize);
-                    reset_acount = false;
-                },
-                Key::Char('/') => { // search
-                    // TODO: reset pattern on search?
-                    // center search mode
-                    self.run_search(screen, keys);
-                },
-                Key::Char('a') => { // archive
-                    self.archive();
-                },
-                Key::Char('d') | Key::Delete => { // delete (with confirmation)
-                    self.run_delete(screen, keys);
-                },
-                Key::Char('r') => { // reload
-                    self.termsize = util::terminal_size();
-                    self.reload_nodes();
-                },
-                Key::Char('s') => { // clear selection
-                    self.clear_selection();
-                },
-                Key::Char(':') => {
-                    self.run_command(screen, keys);
-                },
-                // TODO:
-                // - page down/up
-                // - allow to open/show multiple at once?
-                //   maybe allow to edit/show selected?
-                // - "u": undo?
-                _ => changed = false,
-            }
-
-            if reset_gpending {
-                gpending = false;
-            }
-
-            if reset_acount {
-                acount = 0;
-            }
-
-            // re-render whole screen
-            if changed {
-                self.write_nodes(screen);
-                screen.flush().unwrap();
-            }
+    // Returns whether another iteration should be done, i.e. returns
+    // false when screen should exit
+    pub fn input(&mut self, key: Key, conn: &Connection) -> bool {
+        match &self.state {
+            State::Normal(state) => self.input_normal(&mut state, key, conn),
+            State::Search => self.input_search(key, conn),
+            State::Command(state) => self.input_cmd(&mut state, key, conn),
+            State::Delete(state) => self.input_delete(&mut state, key, conn),
         }
     }
 
-    fn render_search<W: Write>(&self, screen: &mut W) {
-        write!(screen, "{}{}{}{}/{}",
+    pub fn input_normal(&mut self, state: &mut NormalState, key: Key,
+            conn: &Connection) -> bool {
+        let mut reset_acount = true;
+        let mut reset_gpending = true;
+        let mut changed = true;
+        match key {
+            Key::Char('q') => { // quit
+                return false;
+            }
+            Key::Char('j') | Key::Down => { // down
+                self.cursor_down(cmp::max(state.action_count, 1));
+            },
+            Key::Char('k') | Key::Up => { // up
+                self.cursor_up(cmp::max(state.action_count, 1));
+            },
+            Key::Char('G') | Key::End => { // end of list
+                self.hover = self.nodes.len() - 1;
+                self.start = self.hover.saturating_sub(
+                    (self.termy() - 1) as usize);
+            },
+            Key::Home => { // beginning of list, like gg
+                self.start = 0;
+                self.hover = 0;
+            },
+            Key::Char('g') => { // beginning of list; gg detection
+                if state.gpending {
+                    self.start = 0;
+                    self.hover = 0;
+                } else {
+                    state.gpending = true;
+                    reset_gpending = false;
+                    changed = false;
+                }
+            },
+            Key::Char(' ') => { // toggle selection
+                self.nodes[self.hover].selected ^= true;
+            },
+            Key::Char('e') | Key::Char('\n') => { // edit
+                write!(self.screen, "{}", termion::screen::ToMainScreen).unwrap();
+                util::edit(conn, self.nodes[self.hover].id).unwrap();
+                write!(self.screen, "{}{}{}",
+                    termion::screen::ToAlternateScreen,
+                    termion::clear::All,
+                    termion::cursor::Hide).unwrap();
+                self.reload_nodes(conn);
+            },
+            Key::Char('c') => {
+                write!(self.screen, "{}", termion::screen::ToMainScreen).unwrap();
+                // TODO: display error/id in some kind of status line
+                // could display it with timeout (like 1 or 2 seconds)
+                // we wouldn't need an extra thread for that, enough to
+                // check on user input
+                match util::create(conn, None) {
+                    Ok(_) => (),
+                    Err(err) => {
+                        eprintln!("{}", err);
+                    }
+                }
+                write!(self.screen, "{}{}{}",
+                    termion::screen::ToAlternateScreen,
+                    termion::clear::All,
+                    termion::cursor::Hide).unwrap();
+                self.reload_nodes(conn);
+            },
+            Key::Char(c) if c.is_digit(10) => { // number for action count
+                let digit = c.to_digit(10).unwrap() as usize;
+                state.action_count = state.action_count.saturating_mul(10);
+                state.action_count = state.action_count.saturating_add(digit);
+                reset_acount = false;
+                changed = false;
+            },
+            Key::Char('a') => { // archive
+                self.archive(conn);
+            },
+            Key::Char('r') => { // reload
+                self.termsize = util::terminal_size();
+                self.reload_nodes(conn);
+            },
+            Key::Char('s') => { // clear selection
+                self.clear_selection();
+            },
+            Key::Char('d') | Key::Delete => {
+                // enter delete mode (confirmation)
+                let (selection, delete_hover) = self.selection_or_hover();
+                let state = DeleteState{selection, delete_hover};
+                self.state = State::Delete(state);
+            },
+            Key::Char('/') => { // search
+                // enter search mode
+                self.state = State::Search;
+            },
+            Key::Char(':') => {
+                let state = CommandState::default();
+                self.state = State::Command(state);
+            },
+            // TODO:
+            // - page down/up
+            // - allow to open/show multiple at once?
+            //   maybe allow to edit/show selected?
+            // - "u": undo?
+            _ => changed = false,
+        }
+
+        if reset_gpending {
+            state.gpending = false;
+        }
+
+        if reset_acount {
+            state.action_count = 0;
+        }
+
+        // re-render whole screen
+        if changed {
+            self.render();
+        }
+
+        true
+    }
+
+    fn render_search(&self) {
+        write!(self.screen, "{}{}{}{}/{}",
             termion::cursor::Goto(1, self.termy()),
+            termion::clear::CurrentLine,
             termion::color::Fg(termion::color::Reset),
             termion::color::Bg(termion::color::Reset),
-            termion::clear::CurrentLine,
             self.pattern).unwrap();
     }
 
-    pub fn run_search<R: Read, W: Write>(&mut self, screen: &mut W, keys: &mut Keys<R>) {
-        self.render_search(screen);
-        screen.flush().unwrap();
+    pub fn input_search(&mut self, key: Key, conn: &Connection) -> bool {
+        let mut changed = true;
+        let mut end = false;
 
-        for c in keys {
-            let mut changed = true;
-            let mut end = false;
-
-            // TODO: cursor
-            // maybe general utility for line input?
-            match c.unwrap() {
-                Key::Esc | Key::Ctrl('c') | Key::Ctrl('d') => {
-                    end = true;
-                    self.pattern.clear();
-                },
-                Key::Char('\n') => {
+        // TODO: cursor
+        // maybe general utility for line input?
+        match key {
+            Key::Esc | Key::Ctrl('c') | Key::Ctrl('d') => {
+                end = true;
+                self.pattern.clear();
+            },
+            Key::Char('\n') => {
+                end = true;
+                changed = false;
+            },
+            Key::Backspace => {
+                if self.pattern.pop().is_none() {
                     end = true;
                     changed = false;
-                },
-                Key::Backspace => {
-                    if self.pattern.pop().is_none() {
-                        end = true;
-                        changed = false;
-                    }
-                },
-                Key::Char(c) => {
-                    self.pattern.push(c);
-                },
-                _ => changed = false,
-            }
-
-            if changed {
-                if self.reparse_pattern() {
-                    // TODO: we could theoretically track them/jump to
-                    // nearest node
-                    self.hover = 0;
-                    self.start = 0;
-
-                    write!(screen, "{}", termion::clear::All).unwrap();
-                    self.reload_nodes();
-                    self.write_nodes(screen);
                 }
+            },
+            Key::Char(c) => {
+                self.pattern.push(c);
+            },
+            _ => changed = false,
+        }
 
-                self.render_search(screen);
-                screen.flush().unwrap();
-            }
-
-            if end {
-                write!(screen, "{}", termion::clear::All).unwrap();
-                break;
+        if changed {
+            if self.reparse_pattern() {
+                // TODO: we could theoretically track them and jump to
+                // nearest node that still exists for new pattern
+                self.hover = 0;
+                self.start = 0;
+                self.reload_nodes(conn);
             }
         }
+
+        if end {
+            // switch back to normal mode
+            let state = NormalState::default();
+            self.state = State::Normal(state);
+        }
+
+        if changed || end {
+            self.render();
+        }
+
+        true
     }
 
-    pub fn run_delete<R: Read, W: Write>(&mut self, screen: &mut W, keys: &mut Keys<R>) {
-        // TODO: could be done more efficiently if we keep track
-        // of selected nodes in a `Vec<u32> selected`...
-        let (selected, delete_hover) = self.selection_or_hover();
-        let mut nodes_description = "selected nodes".to_string();
-        if delete_hover {
-            nodes_description = format!("node {}", selected[0]);
+    pub fn render_delete(&self, state: &DeleteState) {
+        let nodestxt = "selected nodes".to_string();
+        if state.selection.len() == 1 {
+            nodestxt = format!("node {}", state.selection[0]);
         }
 
-        // render delete confirmation
-        write!(screen, "{}{}{}{}Delete {}? [y/n]",
+        write!(self.screen, "{}{}{}{}Delete {}? [y/n]",
             termion::cursor::Goto(1, self.termy()),
+            termion::clear::CurrentLine,
             termion::color::Fg(termion::color::LightRed),
             termion::color::Bg(termion::color::Reset),
-            termion::clear::CurrentLine,
-            nodes_description).unwrap();
-        screen.flush().unwrap();
-
-        for c in keys {
-            match c.unwrap() {
-                Key::Char('n') |
-                    Key::Char('N') |
-                    Key::Esc |
-                    Key::Ctrl('d') |
-                    Key::Ctrl('c') => {
-                        break;
-                },
-                Key::Char('y') | Key::Char('Y') => {
-                    util::delete_range(&self.conn, &selected).unwrap();
-                    if delete_hover {
-                        self.nodes.remove(self.hover);
-                    } else {
-                        self.nodes.retain(|node| !node.selected);
-                    }
-                    break;
-                },
-                _ => (),
-            }
-        }
+            nodestxt).unwrap();
     }
 
-    fn render_command<W: Write>(&self, screen: &mut W, cmd: &str) {
-        write!(screen, "{}{}{}{}:{}",
+    pub fn input_delete(&mut self, state: &mut DeleteState, key: Key,
+            conn: &Connection) -> bool {
+        let mut end = false;
+        match key {
+            Key::Char('n') |
+                Key::Char('N') |
+                Key::Esc |
+                Key::Ctrl('d') |
+                Key::Ctrl('c') => {
+                    end = true;
+            },
+            Key::Char('y') | Key::Char('Y') => {
+                end = true;
+                util::delete_range(conn, &state.selection).unwrap();
+                if state.delete_hover {
+                    self.nodes.remove(self.hover);
+                } else {
+                    self.nodes.retain(|node| !node.selected);
+                }
+            },
+            _ => (),
+        }
+
+        if end {
+            let state = NormalState::default();
+            self.state = State::Normal(state);
+        }
+
+        true
+    }
+
+    fn render_command(&self, state: &CommandState) {
+        write!(self.screen, "{}{}{}{}:{}",
+            termion::clear::CurrentLine,
             termion::cursor::Goto(1, self.termy()),
             termion::color::Fg(termion::color::Reset),
             termion::color::Bg(termion::color::Reset),
-            termion::clear::CurrentLine,
-            cmd).unwrap();
+            state.command).unwrap();
     }
 
     // TODO: better specific tagging modes (starting just via 't' in normal mode)
     // show context-sensitive suggestions, enter will confirm/use them immediately
-    pub fn run_command<R: Read, W: Write>(&mut self, screen: &mut W, keys: &mut Keys<R>) {
-        let mut command = String::new();
-        self.render_command(screen, &command);
-        screen.flush().unwrap();
+    pub fn input_cmd(&mut self, state: &mut CommandState, key: Key,
+            conn: &Connection) -> bool {
+        let mut end = false;
+        let mut exec = false;
+        let mut change = true;
+        match key {
+            Key::Esc | Key::Ctrl('c') | Key::Ctrl('d')  => {
+                end = true;
+            },
+            Key::Char('\n') => {
+                end = true;
+                exec = true;
+            },
+            Key::Backspace => {
+                if state.command.pop().is_none() {
+                    end = true;
+                }
+            },
+            Key::Char(c) => {
+                state.command.push(c);
+            },
+            _ => change = false,
+        }
 
-        for c in keys {
-            match c.unwrap() {
-                Key::Esc | Key::Ctrl('c') | Key::Ctrl('d') => {
-                    return;
+        if exec {
+            // handle command
+            let args: Vec<&str> = state.command
+                .split(|c| c == ',' || c == ' ')
+                .collect();
+            match args[0] {
+                // TODO: technically we don't have to reload from sql.
+                // we could also just add/remove the tags ourselves,
+                // better performance. But otherwise that might
+                // have correction issues in some cases (not representing
+                // sql state)?
+                "tag" if args.len() > 1 => {
+                    let (nodes, _) = self.selection_or_hover();
+                    util::add_tags(conn, &nodes, &args[1..]).unwrap();
+                    self.reload_nodes(conn);
                 },
-                Key::Char('\n') => {
-                    break;
+                "untag" if args.len() > 1 => {
+                    let (nodes, _) = self.selection_or_hover();
+                    util::remove_tags(conn, &nodes, &args[1..]).unwrap();
+                    self.reload_nodes(conn);
                 },
-                Key::Backspace => {
-                    if command.pop().is_none() {
-                        return;
-                    }
-                },
-                Key::Char(c) => {
-                    command.push(c);
-                    self.render_command(screen, &command);
-                    screen.flush().unwrap();
-                },
-                _ => (),
+                _ => (), // Invalid
             }
         }
 
-        // handle command
-        let args: Vec<&str> = command
-            .split(|c| c == ',' || c == ' ')
-            .collect();
-        match args[0] {
-            "tag" if args.len() > 1 => {
-                let (nodes, _) = self.selection_or_hover();
-                util::add_tags(&self.conn, &nodes, &args[1..]).unwrap();
-                self.clear_selection();
-                self.reload_nodes();
-            },
-            "untag" if args.len() > 1 => {
-                let (nodes, _) = self.selection_or_hover();
-                util::remove_tags(&self.conn, &nodes, &args[1..]).unwrap();
-                self.clear_selection();
-                self.reload_nodes();
-            },
-            _ => (), // Invalid
+        if end {
+            let state = NormalState::default();
+            self.state = State::Normal(state);
         }
+
+        if change || exec || end {
+            self.render();
+        }
+
+        true
     }
 }
 
@@ -505,26 +583,58 @@ pub fn select(conn: &Connection, args: &clap::ArgMatches) -> i32 {
         }
     };
 
-    let mut s = SelectScreen::new(&conn, &args);
-
-    {
-        let ascreen = AlternateScreen::from(raw);
-        let mut screen = BufWriter::new(ascreen);
-        if let Err(err) = write!(screen, "{}", termion::cursor::Hide) {
-            println!("Failed to hide cursor in selection screen: {}", err);
-            return -3;
-        }
-
-        // run interactive select/edit screen
-        s.run_normal(&mut screen, &mut stdin.keys());
-
-        // TODO: do this cleanup in Drop to also execute in on panic
-        // final clear show cursor again
-        write!(screen, "{}{}{}",
-            termion::clear::All,
-            termion::cursor::Goto(1, 1),
-            termion::cursor::Show).unwrap();
+    // set up screen
+    let ascreen = AlternateScreen::from(raw);
+    let mut screen = BufWriter::new(ascreen);
+    if let Err(err) = write!(screen, "{}", termion::cursor::Hide) {
+        println!("Failed to hide cursor in selection screen: {}", err);
+        return -3;
     }
+
+    // TODO: maybe move screen into select screen?
+    let mut s = SelectScreen::new(&conn, &args, &mut screen);
+
+    // put screen an SelectScreen into mutex
+    let mut ms = Mutex::new(s);
+
+    // NOTE: any reason to make this as rendevouz channel?
+    // let (sender, receiver) = sync_channel(0);
+    // let sigsender = sender.clone();
+
+    // signal handler
+    thread::spawn(|| {
+        let signals = Signals::new(&[SIGWINCH]).unwrap();
+        for sig in signals.forever() {
+            if sig == SIGWINCH {
+                // sigsender.send(Message::Resized).unwrap();
+                let s = ms.lock().unwrap();
+                s.resized();
+            }
+        }
+    });
+
+    let keys = stdin.keys();
+    for c in keys {
+        let c = c.unwrap();
+        let s = ms.lock().unwrap();
+        if !s.input(c, conn) {
+            break;
+        }
+    }
+
+    // run interactive select/edit screen
+    // s.run_normal(&mut screen, &mut stdin.keys());
+
+    // TODO: do this cleanup in Drop to also execute in on panic
+    // final clear show cursor again
+    write!(screen, "{}{}{}",
+        termion::clear::All,
+        termion::cursor::Goto(1, 1),
+        termion::cursor::Show).unwrap();
+
+    // move back to s
+    std::mem::drop(ascreen);
+    s = ms.into_inner().unwrap();
 
     // output selected nodes
     for node in s.nodes {
