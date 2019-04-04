@@ -2,7 +2,7 @@ use super::util;
 use nodes::pattern;
 
 use std::{cmp, io, thread};
-use std::sync::{mpsc::sync_channel, Mutex};
+use std::sync::{Mutex, Arc};
 use std::io::prelude::*;
 use std::io::BufWriter;
 
@@ -13,8 +13,8 @@ use termion::input::TermRead;
 use termion::raw::IntoRawMode;
 
 use signal_hook::{iterator::Signals, SIGWINCH};
-
 use rusqlite::Connection;
+use scopeguard::defer;
 
 struct SelectNode {
     id: u32,
@@ -23,44 +23,29 @@ struct SelectNode {
     tags: Vec<String>,
 }
 
-#[derive(Default)]
-struct NormalState {
-    action_count: usize,
-    gpending: bool,
-}
-
-#[derive(Default)]
-struct DeleteState {
-    selection: Vec<u32>,
-    delete_hover: bool,
-}
-
-#[derive(Default)]
-struct CommandState {
-    command: String,
-}
-
 enum State {
-    Normal(NormalState),
+    Normal,
     Search,
-    Command(CommandState),
-    Delete(DeleteState)
+    Command,
+    Delete,
 }
 
-struct SelectScreen<'a, W: Write> {
+struct SelectScreen<W: Write> {
     args: util::ListArgs, // invariant: pattern always Some
     nodes: Vec<SelectNode>,
     hover: usize, // index of node the cursor is over
     start: usize, // in of first node currently displayed
     termsize: (u16, u16), // TODO: handle SIGWINCH as resize handler
     pattern: String, // current search filter
+    screen: W,
     state: State,
-    screen: &'a mut W,
-}
 
-enum Message {
-    InputKey(Key),
-    Resized
+    // state stuff
+    delete_hover: bool,
+    delete_sel: Vec<u32>,
+    command: String,
+    action_count: usize,
+    gpending: bool,
 }
 
 const FG_RESET: termion::color::Fg<termion::color::Reset> =
@@ -68,9 +53,9 @@ const FG_RESET: termion::color::Fg<termion::color::Reset> =
 const BG_RESET: termion::color::Bg<termion::color::Reset> =
     termion::color::Bg(termion::color::Reset);
 
-impl<'a, W: Write> SelectScreen<'a, W> {
-    pub fn new(conn: &Connection, args: &clap::ArgMatches, screen: &'a mut W)
-            -> SelectScreen<'a, W> {
+impl<W: Write> SelectScreen<W> {
+    pub fn new(conn: &Connection, args: &clap::ArgMatches, screen: W)
+            -> SelectScreen<W> {
 
         let mut s = SelectScreen {
             args: util::extract_list_args(&args, true, true),
@@ -79,8 +64,14 @@ impl<'a, W: Write> SelectScreen<'a, W> {
             start: 0,
             termsize: util::terminal_size(),
             pattern: String::new(),
-            state: State::Normal(NormalState::default()),
+            state: State::Normal,
             screen: screen,
+
+            delete_hover: false,
+            delete_sel: Vec::new(),
+            command: String::new(),
+            action_count: 0,
+            gpending: false,
         };
 
         // initial load and render
@@ -183,9 +174,9 @@ impl<'a, W: Write> SelectScreen<'a, W> {
                 termion::clear::AfterCursor).unwrap();
         }
 
-        match &self.state {
-            State::Command(state) => self.render_command(&state),
-            State::Delete(state) => self.render_delete(&state),
+        match self.state {
+            State::Command => self.render_command(),
+            State::Delete => self.render_delete(),
             State::Search => self.render_search(),
             _ => (),
         };
@@ -268,16 +259,15 @@ impl<'a, W: Write> SelectScreen<'a, W> {
     // Returns whether another iteration should be done, i.e. returns
     // false when screen should exit
     pub fn input(&mut self, key: Key, conn: &Connection) -> bool {
-        match &self.state {
-            State::Normal(state) => self.input_normal(&mut state, key, conn),
+        match self.state {
+            State::Normal => self.input_normal(key, conn),
             State::Search => self.input_search(key, conn),
-            State::Command(state) => self.input_cmd(&mut state, key, conn),
-            State::Delete(state) => self.input_delete(&mut state, key, conn),
+            State::Command => self.input_cmd(key, conn),
+            State::Delete => self.input_delete(key, conn),
         }
     }
 
-    pub fn input_normal(&mut self, state: &mut NormalState, key: Key,
-            conn: &Connection) -> bool {
+    pub fn input_normal(&mut self, key: Key, conn: &Connection) -> bool {
         let mut reset_acount = true;
         let mut reset_gpending = true;
         let mut changed = true;
@@ -286,10 +276,10 @@ impl<'a, W: Write> SelectScreen<'a, W> {
                 return false;
             }
             Key::Char('j') | Key::Down => { // down
-                self.cursor_down(cmp::max(state.action_count, 1));
+                self.cursor_down(cmp::max(self.action_count, 1));
             },
             Key::Char('k') | Key::Up => { // up
-                self.cursor_up(cmp::max(state.action_count, 1));
+                self.cursor_up(cmp::max(self.action_count, 1));
             },
             Key::Char('G') | Key::End => { // end of list
                 self.hover = self.nodes.len() - 1;
@@ -301,11 +291,11 @@ impl<'a, W: Write> SelectScreen<'a, W> {
                 self.hover = 0;
             },
             Key::Char('g') => { // beginning of list; gg detection
-                if state.gpending {
+                if self.gpending {
                     self.start = 0;
                     self.hover = 0;
                 } else {
-                    state.gpending = true;
+                    self.gpending = true;
                     reset_gpending = false;
                     changed = false;
                 }
@@ -342,8 +332,8 @@ impl<'a, W: Write> SelectScreen<'a, W> {
             },
             Key::Char(c) if c.is_digit(10) => { // number for action count
                 let digit = c.to_digit(10).unwrap() as usize;
-                state.action_count = state.action_count.saturating_mul(10);
-                state.action_count = state.action_count.saturating_add(digit);
+                self.action_count = self.action_count.saturating_mul(10);
+                self.action_count = self.action_count.saturating_add(digit);
                 reset_acount = false;
                 changed = false;
             },
@@ -359,17 +349,17 @@ impl<'a, W: Write> SelectScreen<'a, W> {
             },
             Key::Char('d') | Key::Delete => {
                 // enter delete mode (confirmation)
-                let (selection, delete_hover) = self.selection_or_hover();
-                let state = DeleteState{selection, delete_hover};
-                self.state = State::Delete(state);
+                let (sel, dhover) = self.selection_or_hover();
+                self.delete_sel = sel;
+                self.delete_hover = dhover;
+                self.state = State::Delete;
             },
             Key::Char('/') => { // search
                 // enter search mode
                 self.state = State::Search;
             },
             Key::Char(':') => {
-                let state = CommandState::default();
-                self.state = State::Command(state);
+                self.state = State::Command;
             },
             // TODO:
             // - page down/up
@@ -380,11 +370,11 @@ impl<'a, W: Write> SelectScreen<'a, W> {
         }
 
         if reset_gpending {
-            state.gpending = false;
+            self.gpending = false;
         }
 
         if reset_acount {
-            state.action_count = 0;
+            self.action_count = 0;
         }
 
         // re-render whole screen
@@ -395,7 +385,7 @@ impl<'a, W: Write> SelectScreen<'a, W> {
         true
     }
 
-    fn render_search(&self) {
+    fn render_search(&mut self) {
         write!(self.screen, "{}{}{}{}/{}",
             termion::cursor::Goto(1, self.termy()),
             termion::clear::CurrentLine,
@@ -443,8 +433,7 @@ impl<'a, W: Write> SelectScreen<'a, W> {
 
         if end {
             // switch back to normal mode
-            let state = NormalState::default();
-            self.state = State::Normal(state);
+            self.state = State::Normal;
         }
 
         if changed || end {
@@ -454,10 +443,10 @@ impl<'a, W: Write> SelectScreen<'a, W> {
         true
     }
 
-    pub fn render_delete(&self, state: &DeleteState) {
-        let nodestxt = "selected nodes".to_string();
-        if state.selection.len() == 1 {
-            nodestxt = format!("node {}", state.selection[0]);
+    pub fn render_delete(&mut self) {
+        let mut nodestxt = "selected nodes".to_string();
+        if self.delete_sel.len() == 1 {
+            nodestxt = format!("node {}", self.delete_sel[0]);
         }
 
         write!(self.screen, "{}{}{}{}Delete {}? [y/n]",
@@ -468,8 +457,7 @@ impl<'a, W: Write> SelectScreen<'a, W> {
             nodestxt).unwrap();
     }
 
-    pub fn input_delete(&mut self, state: &mut DeleteState, key: Key,
-            conn: &Connection) -> bool {
+    pub fn input_delete(&mut self, key: Key, conn: &Connection) -> bool {
         let mut end = false;
         match key {
             Key::Char('n') |
@@ -481,8 +469,8 @@ impl<'a, W: Write> SelectScreen<'a, W> {
             },
             Key::Char('y') | Key::Char('Y') => {
                 end = true;
-                util::delete_range(conn, &state.selection).unwrap();
-                if state.delete_hover {
+                util::delete_range(conn, &self.delete_sel).unwrap();
+                if self.delete_hover {
                     self.nodes.remove(self.hover);
                 } else {
                     self.nodes.retain(|node| !node.selected);
@@ -492,26 +480,24 @@ impl<'a, W: Write> SelectScreen<'a, W> {
         }
 
         if end {
-            let state = NormalState::default();
-            self.state = State::Normal(state);
+            self.state = State::Normal;
         }
 
         true
     }
 
-    fn render_command(&self, state: &CommandState) {
+    fn render_command(&mut self) {
         write!(self.screen, "{}{}{}{}:{}",
             termion::clear::CurrentLine,
             termion::cursor::Goto(1, self.termy()),
             termion::color::Fg(termion::color::Reset),
             termion::color::Bg(termion::color::Reset),
-            state.command).unwrap();
+            self.command).unwrap();
     }
 
     // TODO: better specific tagging modes (starting just via 't' in normal mode)
     // show context-sensitive suggestions, enter will confirm/use them immediately
-    pub fn input_cmd(&mut self, state: &mut CommandState, key: Key,
-            conn: &Connection) -> bool {
+    pub fn input_cmd(&mut self, key: Key, conn: &Connection) -> bool {
         let mut end = false;
         let mut exec = false;
         let mut change = true;
@@ -524,19 +510,19 @@ impl<'a, W: Write> SelectScreen<'a, W> {
                 exec = true;
             },
             Key::Backspace => {
-                if state.command.pop().is_none() {
+                if self.command.pop().is_none() {
                     end = true;
                 }
             },
             Key::Char(c) => {
-                state.command.push(c);
+                self.command.push(c);
             },
             _ => change = false,
         }
 
         if exec {
             // handle command
-            let args: Vec<&str> = state.command
+            let args: Vec<&str> = self.command
                 .split(|c| c == ',' || c == ' ')
                 .collect();
             match args[0] {
@@ -557,11 +543,11 @@ impl<'a, W: Write> SelectScreen<'a, W> {
                 },
                 _ => (), // Invalid
             }
+            self.command = String::new();
         }
 
         if end {
-            let state = NormalState::default();
-            self.state = State::Normal(state);
+            self.state = State::Normal;
         }
 
         if change || exec || end {
@@ -584,60 +570,55 @@ pub fn select(conn: &Connection, args: &clap::ArgMatches) -> i32 {
     };
 
     // set up screen
-    let ascreen = AlternateScreen::from(raw);
-    let mut screen = BufWriter::new(ascreen);
+    // let ascreen = AlternateScreen::from(raw);
+    // let mut screen = BufWriter::new(ascreen);
+    let mut screen = BufWriter::new(raw);
     if let Err(err) = write!(screen, "{}", termion::cursor::Hide) {
         println!("Failed to hide cursor in selection screen: {}", err);
         return -3;
     }
 
-    // TODO: maybe move screen into select screen?
-    let mut s = SelectScreen::new(&conn, &args, &mut screen);
-
-    // put screen an SelectScreen into mutex
-    let mut ms = Mutex::new(s);
-
-    // NOTE: any reason to make this as rendevouz channel?
-    // let (sender, receiver) = sync_channel(0);
-    // let sigsender = sender.clone();
+    let ms = Arc::new(Mutex::new(SelectScreen::new(&conn, &args, screen)));
 
     // signal handler
-    thread::spawn(|| {
-        let signals = Signals::new(&[SIGWINCH]).unwrap();
-        for sig in signals.forever() {
-            if sig == SIGWINCH {
-                // sigsender.send(Message::Resized).unwrap();
-                let s = ms.lock().unwrap();
-                s.resized();
-            }
-        }
-    });
+    {
+        defer!{{
+            let mut screen = ms.lock().unwrap();
+            write!(screen.screen, "{}{}{}{}",
+                termion::clear::All,
+                termion::cursor::Goto(1, 1),
+                termion::cursor::Show,
+                termion::screen::ToMainScreen,
+            ).unwrap();
+            screen.screen.flush().unwrap();
+        }};
 
-    let keys = stdin.keys();
-    for c in keys {
-        let c = c.unwrap();
-        let s = ms.lock().unwrap();
-        if !s.input(c, conn) {
-            break;
+        let tms = ms.clone();
+        let t = thread::spawn(move || {
+            let signals = Signals::new(&[SIGWINCH]).unwrap();
+            for sig in signals.forever() {
+                if sig == SIGWINCH {
+                    // sigsender.send(Message::Resized).unwrap();
+                    let mut s = tms.lock().unwrap();
+                    eprintln!("resizing");
+                    s.resized();
+                }
+            }
+        });
+
+        let keys = stdin.keys();
+        for c in keys {
+            let c = c.unwrap();
+            let mut s = ms.lock().unwrap();
+            if !s.input(c, conn) {
+                break;
+            }
         }
     }
 
-    // run interactive select/edit screen
-    // s.run_normal(&mut screen, &mut stdin.keys());
-
-    // TODO: do this cleanup in Drop to also execute in on panic
-    // final clear show cursor again
-    write!(screen, "{}{}{}",
-        termion::clear::All,
-        termion::cursor::Goto(1, 1),
-        termion::cursor::Show).unwrap();
-
-    // move back to s
-    std::mem::drop(ascreen);
-    s = ms.into_inner().unwrap();
-
     // output selected nodes
-    for node in s.nodes {
+    let mut s = ms.lock().unwrap();
+    for node in &s.nodes {
         if node.selected {
             println!("{}", node.id);
         }
