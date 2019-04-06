@@ -10,6 +10,7 @@ use std::time::Duration;
 use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
+use signal_hook::{iterator::Signals, SIGWINCH};
 
 use rusqlite::Connection;
 use scopeguard::defer;
@@ -80,12 +81,11 @@ impl<W: Write> SelectScreen<W> {
     }
 
     pub fn reload_nodes(&mut self, conn: &Connection) {
-        let termsize = util::terminal_size();
-        let width = (termsize.0 - 8) as usize;
-
         let mut nodes = Vec::new();
         util::iter_nodes(conn, &self.args, |node| {
-            let summary = util::node_summary(&node.content, 1, width);
+            // we use the whole first line as summary since we don't reload
+            // the summary on every terminal resize
+            let summary = node.content.lines().next().unwrap_or("").to_string();
             let tags = node.tags.iter().map(|s| s.to_string()).collect();
             nodes.push(SelectNode{
                 id: node.id,
@@ -142,7 +142,7 @@ impl<W: Write> SelectScreen<W> {
             }
 
             let idstr = node.id.to_string();
-            let width = (self.termx() as usize) - idstr.len() - 2;
+            let width = (self.termx() as usize) - idstr.len() - 3;
             let mut sumwidth = width;
             let mut tagswidth = 0;
             // TODO: don't hardcode distribution
@@ -152,15 +152,23 @@ impl<W: Write> SelectScreen<W> {
             }
 
             let mut tags = String::new();
-            if !node.tags.is_empty() {
+            if tagswidth > 0 && !node.tags.is_empty() {
                 tags = "[".to_string() + &node.tags.join("][") + "]";
+
+                // tags = util::short_string(&tags, tagswidth);
+                // TODO: only show tags that can be completely shown
+                // and are not cut off (maybe add [...] in the case
+                // that there are remaining tags?)
             }
 
-            write!(self.screen, "{}{}{}: {:<sw$}  {:>tw$}",
+            // shorten, maybe terminal was resized since then
+            let summary = util::short_string(&node.summary, sumwidth);
+
+            // TODO: clear line first?
+            write!(self.screen, "{}{}: {:<sw$} {:>tw$.tw$}",
                 termion::cursor::Goto(x, y),
-                termion::clear::CurrentLine,
-                node.id, node.summary, tags,
-                sw = sumwidth - 2, tw = tagswidth).unwrap();
+                node.id, summary, tags,
+                sw = sumwidth, tw = tagswidth).unwrap();
 
             y += 1;
             i += 1;
@@ -574,9 +582,10 @@ pub fn select(conn: &Connection, args: &clap::ArgMatches) -> i32 {
         };
 
         // set up screen
-        // let ascreen = AlternateScreen::from(raw);
-        // let mut screen = BufWriter::new(ascreen);
-        let mut screen = BufWriter::new(raw);
+        let screen = termion::screen::AlternateScreen::from(raw);
+        // 256K capacity in the BufWriter since we don't ever want to flush
+        // before we have to (and render a partial result)
+        let mut screen = BufWriter::with_capacity(1024 * 256, screen);
         if let Err(err) = write!(screen, "{}", termion::cursor::Hide) {
             println!("Failed to hide cursor in selection screen: {}", err);
             return -3;
@@ -589,7 +598,8 @@ pub fn select(conn: &Connection, args: &clap::ArgMatches) -> i32 {
         let trun_size = run_size.clone();
         let tms = ms.clone();
 
-        // TODO: use signal again...
+        // TODO: use signal again instead
+        // cleanup cleanup process
         let sizet = thread::spawn(move || {
             let mut termsize = util::terminal_size();
             while trun_size.load(atomic::Ordering::SeqCst) {
@@ -600,8 +610,20 @@ pub fn select(conn: &Connection, args: &clap::ArgMatches) -> i32 {
                     s.resized(termsize);
                 }
 
-                thread::sleep(Duration::from_millis(1));
+                thread::sleep(Duration::from_millis(10));
             }
+
+            /*
+            let signals = Signals::new(&[SIGWINCH]).unwrap();
+            for sig in signals.forever() {
+                if sig == SIGWINCH {
+                    // sigsender.send(Message::Resized).unwrap();
+                    let mut s = tms.lock().unwrap();
+                    eprintln!("resizing");
+                    s.resized(util::terminal_size());
+                }
+            }
+            */
         });
 
         // make sure terminal is cleaned up
