@@ -81,6 +81,12 @@ impl<W: Write> SelectScreen<W> {
     }
 
     pub fn reload_nodes(&mut self, conn: &Connection) {
+        // TODO: solution for keeping selected nodes after reload can be improved
+        let selected: Vec<u32> = self.nodes.iter()
+            .filter(|node| node.selected)
+            .map(|node| node.id)
+            .collect();
+
         let mut nodes = Vec::new();
         util::iter_nodes(conn, &self.args, |node| {
             // we use the whole first line as summary since we don't reload
@@ -90,7 +96,7 @@ impl<W: Write> SelectScreen<W> {
             nodes.push(SelectNode{
                 id: node.id,
                 summary: summary,
-                selected: false,
+                selected: selected.contains(&node.id),
                 tags: tags,
             });
         });
@@ -490,6 +496,7 @@ impl<W: Write> SelectScreen<W> {
             self.state = State::Normal;
         }
 
+        self.render();
         true
     }
 
@@ -510,6 +517,7 @@ impl<W: Write> SelectScreen<W> {
         let mut change = true;
         match key {
             Key::Esc | Key::Ctrl('c') | Key::Ctrl('d')  => {
+                self.command.clear();
                 end = true;
             },
             Key::Char('\n') => {
