@@ -62,21 +62,20 @@ pub fn tosql(pattern: &CondNode) -> String {
             query += "%')";
         }, CondNodeType::Tag(string) => {
             let escaped = string.replace("'", "''");
-            query += "(tag = '";
-            query += &escaped;
-            query += "')";
+            query += &format!("(EXISTS(SELECT 1 FROM tags WHERE
+                node LIKE nodes.id AND tag = '{}'))",
+                &escaped);
         }, CondNodeType::TagMatch(string) => {
             let escaped = string.replace("'", "''");
-            query += "(tag LIKE '%";
-            query += &escaped;
-            query += "%')";
+            query += &format!("(EXISTS(SELECT 1 FROM tags WHERE
+                node LIKE nodes.id AND tag LIKE '%{}%'))",
+                &escaped);
         }, CondNodeType::Match(string) => {
             let escaped = string.replace("'", "''");
-            query += "(content LIKE '%";
-            query += &escaped;
-            query += "%' OR tag LIKE '%";
-            query += &escaped;
-            query += "%')";
+            query += &format!("(content LIKE '%{0}%' OR
+                EXISTS(SELECT 1 FROM tags WHERE
+                node LIKE nodes.id AND tag LIKE '%{0}%'))",
+                &escaped);
         }
     }
 

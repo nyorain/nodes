@@ -40,6 +40,9 @@ struct SelectScreen<W: Write> {
     screen: W,
     state: State,
 
+    // config
+    cursor_off: usize,
+
     // state stuff
     delete_hover: bool,
     delete_sel: Vec<u32>,
@@ -66,6 +69,7 @@ impl<W: Write> SelectScreen<W> {
             pattern: String::new(),
             state: State::Normal,
             screen: screen,
+            cursor_off: 20,
 
             delete_hover: false,
             delete_sel: Vec::new(),
@@ -181,8 +185,14 @@ impl<W: Write> SelectScreen<W> {
         }
 
         if y < self.termy() {
+            let y = if y > 1 {
+                y + 1
+            } else {
+                y
+            };
+
             write!(self.screen, "{}{}{}{}",
-                termion::cursor::Goto(x, y + 1),
+                termion::cursor::Goto(x, y),
                 BG_RESET, FG_RESET,
                 termion::clear::AfterCursor).unwrap();
         }
@@ -214,20 +224,43 @@ impl<W: Write> SelectScreen<W> {
         }
     }
 
+    pub fn correct_hover(&mut self) {
+        if self.nodes.is_empty() {
+            self.hover = 0;
+            self.start = 0;
+            return;
+        }
+
+        self.hover = cmp::min(self.nodes.len() - 1, self.hover);
+
+        let topd = cmp::min(self.cursor_off, self.hover);
+        let topd = cmp::min(topd, (self.termy() as usize) / 2);
+        let top = self.start + topd;
+        if self.hover < top {
+            self.start = self.hover;
+            self.start = self.start.saturating_sub(topd);
+        }
+
+        let botd = cmp::min(self.cursor_off, self.nodes.len() - 1 - self.hover);
+        let botd = cmp::min(botd, (self.termy() as usize - 1) / 2);
+        let bot = self.start + (self.termy() as usize);
+        let bot = bot.saturating_sub(botd);
+        if self.hover >= bot {
+            self.start = self.hover + botd;
+            self.start = self.start.saturating_sub((self.termy() - 1) as usize);
+        }
+    }
+
     // moves cursor down by n
     pub fn cursor_down(&mut self, n: usize) {
-        self.hover = cmp::min(self.nodes.len() - 1, self.hover + n);
-        if self.hover - self.start >= (self.termy() as usize) {
-            self.start = self.hover - ((self.termy() - 1) as usize);
-        }
+        self.hover += n;
+        self.correct_hover();
     }
 
     // moves cursor up by n
     pub fn cursor_up(&mut self, n: usize) {
         self.hover = self.hover.saturating_sub(n);
-        if self.hover < self.start {
-            self.start = self.hover;
-        }
+        self.correct_hover();
     }
 
     pub fn selection_or_hover(&self) -> (Vec<u32>, bool) {
@@ -237,7 +270,7 @@ impl<W: Write> SelectScreen<W> {
             .filter(|node| node.selected)
             .map(|node| node.id)
             .collect();
-        if selected.is_empty() {
+        if selected.is_empty() && !self.nodes.is_empty() {
             (vec!(self.nodes[self.hover].id), true)
         } else {
             (selected, false)
@@ -245,13 +278,9 @@ impl<W: Write> SelectScreen<W> {
     }
 
     pub fn archive(&mut self, conn: &Connection) {
-        let selected: Vec<u32> = self.nodes.iter()
-            .filter(|node| node.selected)
-            .map(|node| node.id)
-            .collect();
-        if selected.is_empty() {
-            let id = self.nodes[self.hover].id;
-            util::toggle_archived(conn, id).unwrap();
+        let (selected, hovered) = self.selection_or_hover();
+        if hovered {
+            util::toggle_archived(conn, selected[0]).unwrap();
             if self.args.archived.is_some() {
                 self.nodes.remove(self.hover);
             }
@@ -313,10 +342,10 @@ impl<W: Write> SelectScreen<W> {
                     changed = false;
                 }
             },
-            Key::Char(' ') => { // toggle selection
+            Key::Char(' ') if !self.nodes.is_empty() => { // toggle selection
                 self.nodes[self.hover].selected ^= true;
             },
-            Key::Char('e') | Key::Char('\n') => { // edit
+            Key::Char('e') | Key::Char('\n') if !self.nodes.is_empty() => { // edit
                 write!(self.screen, "{}", termion::screen::ToMainScreen).unwrap();
                 util::edit(conn, self.nodes[self.hover].id).unwrap();
                 write!(self.screen, "{}{}{}",
@@ -363,9 +392,11 @@ impl<W: Write> SelectScreen<W> {
             Key::Char('d') | Key::Delete => {
                 // enter delete mode (confirmation)
                 let (sel, dhover) = self.selection_or_hover();
-                self.delete_sel = sel;
-                self.delete_hover = dhover;
-                self.state = State::Delete;
+                if !sel.is_empty() {
+                    self.delete_sel = sel;
+                    self.delete_hover = dhover;
+                    self.state = State::Delete;
+                }
             },
             Key::Char('/') => { // search
                 // enter search mode
@@ -509,6 +540,46 @@ impl<W: Write> SelectScreen<W> {
             self.command).unwrap();
     }
 
+    pub fn exec_cmd(&mut self, args: &[&str], conn: &Connection) {
+        match args[0] {
+            // TODO: technically we don't have to reload from sql.
+            // we could also just add/remove the tags ourselves,
+            // better performance. But otherwise that might
+            // have correction issues in some cases (not representing
+            // sql state)?
+            "t" | "tag" if args.len() > 1 => {
+                // TODO: remove pure whitespace args/tags
+                let (nodes, _) = self.selection_or_hover();
+                util::add_tags(conn, &nodes, &args[1..]).unwrap();
+                self.reload_nodes(conn);
+            },
+            "ut" | "untag" if args.len() > 1 => {
+                let (nodes, _) = self.selection_or_hover();
+                util::remove_tags(conn, &nodes, &args[1..]).unwrap();
+                self.reload_nodes(conn);
+            },
+            // TODO: is using 2 commands really intuitive?
+            // maybe rather something like ":a true|false|both"?
+            "a" => { // toggle show archived
+                self.args.archived = match self.args.archived {
+                    None => Some(false),
+                    Some(false) => None,
+                    // don't toggle it in this case, see :A
+                    Some(true) => Some(true),
+                };
+                self.reload_nodes(conn);
+            },
+            "A" => { // toggle only show archived
+                self.args.archived = match self.args.archived {
+                    Some(true) => Some(false),
+                    _ => Some(true),
+                };
+                self.reload_nodes(conn);
+            }
+            _ => (), // Invalid
+        }
+    }
+
     // TODO: better specific tagging modes (starting just via 't' in normal mode)
     // show context-sensitive suggestions, enter will confirm/use them immediately
     pub fn input_cmd(&mut self, key: Key, conn: &Connection) -> bool {
@@ -537,27 +608,12 @@ impl<W: Write> SelectScreen<W> {
 
         if exec {
             // handle command
-            let args: Vec<&str> = self.command
+            let mut command = String::new();
+            std::mem::swap(&mut command, &mut self.command);
+            let args: Vec<&str> = command
                 .split(|c| c == ',' || c == ' ')
                 .collect();
-            match args[0] {
-                // TODO: technically we don't have to reload from sql.
-                // we could also just add/remove the tags ourselves,
-                // better performance. But otherwise that might
-                // have correction issues in some cases (not representing
-                // sql state)?
-                "tag" if args.len() > 1 => {
-                    let (nodes, _) = self.selection_or_hover();
-                    util::add_tags(conn, &nodes, &args[1..]).unwrap();
-                    self.reload_nodes(conn);
-                },
-                "untag" if args.len() > 1 => {
-                    let (nodes, _) = self.selection_or_hover();
-                    util::remove_tags(conn, &nodes, &args[1..]).unwrap();
-                    self.reload_nodes(conn);
-                },
-                _ => (), // Invalid
-            }
+            self.exec_cmd(&args, &conn);
             self.command = String::new();
         }
 
