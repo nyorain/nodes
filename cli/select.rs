@@ -184,19 +184,15 @@ impl<W: Write> SelectScreen<W> {
             i += 1;
         }
 
+        // clear remaining screen
         if y < self.termy() {
-            let y = if y > 1 {
-                y + 1
-            } else {
-                y
-            };
-
             write!(self.screen, "{}{}{}{}",
                 termion::cursor::Goto(x, y),
                 BG_RESET, FG_RESET,
                 termion::clear::AfterCursor).unwrap();
         }
 
+        // render special state-dependent stuff
         match self.state {
             State::Command => self.render_command(),
             State::Delete => self.render_delete(),
