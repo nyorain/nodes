@@ -18,6 +18,7 @@ use scopeguard::defer;
 #[derive(Clone)]
 struct SelectNode {
     id: u32,
+    priority: i32,
     summary: String,
     selected: bool,
     tags: Vec<String>,
@@ -99,6 +100,7 @@ impl<W: Write> SelectScreen<W> {
             let tags = node.tags.iter().map(|s| s.to_string()).collect();
             nodes.push(SelectNode{
                 id: node.id,
+                priority: node.priority,
                 summary: summary,
                 selected: selected.contains(&node.id),
                 tags: tags,
@@ -161,9 +163,10 @@ impl<W: Write> SelectScreen<W> {
                 tagswidth = width - sumwidth;
             }
 
-            let mut tags = String::new();
+            // let mut tags = String::new();
+            let mut tags = format!("({})", node.priority);
             if tagswidth > 0 && !node.tags.is_empty() {
-                tags = "[".to_string() + &node.tags.join("][") + "]";
+                tags += &("[".to_string() + &node.tags.join("][") + "]");
 
                 // tags = util::short_string(&tags, tagswidth);
                 // TODO: only show tags that can be completely shown
@@ -259,6 +262,8 @@ impl<W: Write> SelectScreen<W> {
         self.correct_hover();
     }
 
+    // The bool returns whether the hovered node is returned instead
+    // of the selection
     pub fn selection_or_hover(&self) -> (Vec<u32>, bool) {
         // TODO: could be done more efficiently if we keep track
         // of selected nodes in a `Vec<u32> selected`...
@@ -303,6 +308,26 @@ impl<W: Write> SelectScreen<W> {
             State::Command => self.input_cmd(key, conn),
             State::Delete => self.input_delete(key, conn),
         }
+    }
+
+    fn next_sort_mode(&mut self) {
+        self.args.sort = match &self.args.sort {
+            Some(util::Sort::ID) => { Some(util::Sort::Edited) },
+            Some(util::Sort::Edited) => { Some(util::Sort::Priority) },
+            Some(util::Sort::Priority) => { Some(util::Sort::ID) },
+            None => None,
+        };
+    }
+
+    fn set_hover_to_id(&mut self, id: u32) {
+        for (i, node) in self.nodes.iter().enumerate() {
+            if node.id == id {
+                self.hover = i;
+                break;
+            }
+        }
+
+        self.correct_hover();
     }
 
     pub fn input_normal(&mut self, key: Key, conn: &Connection) -> bool {
@@ -400,6 +425,24 @@ impl<W: Write> SelectScreen<W> {
             },
             Key::Char(':') => {
                 self.state = State::Command;
+            },
+            Key::Ctrl('o') => {
+                self.next_sort_mode();
+                self.reload_nodes(conn);
+            },
+            Key::Char('J') => {
+                let hover = self.nodes[self.hover].id;
+                let (nodes, _) = self.selection_or_hover();
+                util::priority_add(conn, &nodes, -1).unwrap();
+                self.reload_nodes(conn);
+                self.set_hover_to_id(hover);
+            },
+            Key::Char('K') => {
+                let hover = self.nodes[self.hover].id;
+                let (nodes, _) = self.selection_or_hover();
+                util::priority_add(conn, &nodes, 1).unwrap();
+                self.reload_nodes(conn);
+                self.set_hover_to_id(hover);
             },
             // TODO:
             // - page down/up
@@ -670,9 +713,11 @@ pub fn select(conn: &Connection, args: &clap::ArgMatches) -> i32 {
                     s.resized(termsize);
                 }
 
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(50));
             }
 
+            // alternative, more efficient implementation
+            // problem: not sure how to terminate when joining...
             /*
             let signals = Signals::new(&[SIGWINCH]).unwrap();
             for sig in signals.forever() {

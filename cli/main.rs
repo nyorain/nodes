@@ -62,6 +62,8 @@ fn main() -> rusqlite::Result<()> {
                 "Only show archived nodes")
             (@arg reverse: -r --rev !takes_value !required
                 "Reverses the node/display order. Default is ascending")
+            (@arg sort: -s --sort +takes_value !required
+                "How to initially sort the nodes: id | priority | edited")
         ) (@subcommand ls =>
             (about: "Lists existing notes")
             (@arg pattern: index(1)
@@ -82,6 +84,8 @@ fn main() -> rusqlite::Result<()> {
                 "Include archived nodes")
             (@arg only_archived: -A !takes_value !required
                 "Only show archived nodes")
+            (@arg sort: -s --sort +takes_value !required
+                "How to sort the nodes: id | priority | edited")
         ) (@subcommand output =>
             (about: "Output the content of a node")
             (alias: "o")

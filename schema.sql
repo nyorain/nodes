@@ -10,7 +10,8 @@ CREATE TABLE nodes (
 	created DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, -- creation date
 	edited DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, -- last edit date (edit command invoked)
 	viewed DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, -- last date viewed (edit/show command invoked)
-	archived BOOLEAN NOT NULL DEFAULT false
+	archived BOOLEAN NOT NULL DEFAULT false,
+	priority INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE tags (

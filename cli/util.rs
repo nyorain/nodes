@@ -23,6 +23,29 @@ impl Order {
             Order::Desc => "DESC",
         }
     }
+
+    pub fn toggle(&self) -> Order {
+        match self {
+            Order::Asc => Order::Desc,
+            Order::Desc => Order::Asc,
+        }
+    }
+}
+
+pub enum Sort {
+    ID,
+    Priority,
+    Edited,
+}
+
+impl Sort {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Sort::ID => "id",
+            Sort::Priority => "priority",
+            Sort::Edited => "edited",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -186,6 +209,7 @@ pub fn gather_nodes(args: &clap::ArgMatches, argname: &str) -> Vec<u32> {
 
 pub struct Node<'a> {
     pub id: u32,
+    pub priority: i32,
     pub content: &'a str,
     pub tags: Vec<&'a str>
 }
@@ -196,6 +220,7 @@ pub struct ListArgs {
     pub count: Option<usize>,
     pub pattern: Option<pattern::CondNode>,
     pub archived: Option<bool>,
+    pub sort: Option<Sort>,
 }
 
 // default order (reverse = false) is ascending for both
@@ -227,33 +252,46 @@ pub fn iter_nodes<F: FnMut(&Node)>(conn: &Connection,
         qlimit = format!("LIMIT {}", count);
     }
 
+    let mut preorder = String::new();
+    let mut postorder = String::new();
+    if let Some(sort) = &args.sort {
+        preorder = format!("ORDER BY {sort} {order}",
+            sort = sort.name(),
+            order = args.preorder.name());
+        postorder = format!("ORDER BY {sort} {order}",
+            sort = sort.name(),
+            order = args.postorder.name());
+    }
+
     let mut query = format!("
-        SELECT DISTINCT id, content, GROUP_CONCAT(tag)
+        SELECT DISTINCT id, priority, content, GROUP_CONCAT(tag)
         FROM nodes
             LEFT JOIN tags ON nodes.id = tags.node
         {where}
         GROUP BY id
-        ORDER BY id {order}
+        {order}
         {limit}",
         where = qwhere,
         limit = qlimit,
-        order = args.preorder.name());
+        order = preorder);
 
     if args.preorder != args.postorder {
         query = format!("
             SELECT *
             FROM ({query})
-            ORDER BY id {order}",
-            query = query, order = args.postorder.name());
+            {order}",
+            query = query,
+            order = postorder);
     }
 
     let mut stmt = conn.prepare_cached(&query).unwrap();
     let mut rows = stmt.query(rusqlite::NO_PARAMS).unwrap();
     while let Some(row) = rows.next().unwrap() {
-        let tags = row.get_raw(2).as_str().map(|s| s.split(",").collect());
+        let tags = row.get_raw(3).as_str().map(|s| s.split(",").collect());
         let n = Node {
             id: row.get_unwrap(0),
-            content: row.get_raw(1).as_str().unwrap(),
+            priority: row.get_unwrap(1),
+            content: row.get_raw(2).as_str().unwrap(),
             tags: tags.unwrap_or(Vec::new())
         };
         op(&n);
@@ -287,12 +325,24 @@ pub fn extract_list_args<'a>(args: &'a clap::ArgMatches, mut reverse: bool,
         }, None => None,
     };
 
+    let sort = match args.value_of("sort") {
+        Some("id") => Sort::ID,
+        Some("priority") => Sort::Priority,
+        Some("edited") => Sort::Edited,
+        Some(s) => {
+            eprintln!("Invalid sorting mode: {}", s);
+            std::process::exit(0);
+        },
+        None => Sort::ID,
+    };
+
     ListArgs {
         preorder: if reverse { Order::Desc } else { Order::Asc },
         postorder: if reverse_display { Order::Desc } else { Order::Asc },
         pattern: pattern,
         count: limit,
         archived: archived,
+        sort: Some(sort),
     }
 }
 
@@ -466,6 +516,23 @@ pub fn remove_tags<S: AsRef<str>>(conn: &Connection, ids: &[u32], tags: &[S])
         .collect();
     for tag in &rtags {
         query += &format!("{}'{}'", comma, tag);
+        comma = ", ";
+    }
+    query += ")";
+
+    conn.execute(&query, rusqlite::NO_PARAMS)?;
+    Ok(())
+}
+
+pub fn priority_add(conn: &Connection, ids: &[u32], offset: i32)
+        -> Result<(), Error> {
+    let mut query = "UPDATE nodes SET priority = priority + ".to_string();
+    query += &format!("{}", offset);
+
+    query += " WHERE id IN (";
+    let mut comma = "";
+    for id in ids {
+        query += &format!("{}{}", comma, id);
         comma = ", ";
     }
     query += ")";
